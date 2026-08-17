@@ -84,5 +84,60 @@ impl BplusTree {
             }
         }
     }
+
+    fn breadcrumbs(&self, key: u64) -> Result<BreadCumbs, Box<dyn Error>> {
+        let mut breadcrumb: Vec<u64> = Vec::new();
+
+        let mut page_id = self.root_id;
+
+        loop {
+            let (cells, p_hdr) = {
+                let page = self.pager.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells()?, p_hdr)
+            };
+
+            breadcrumb.push(p_hdr.id);
+            match cells.binary_search_by(|c| c.key.cmp(&key)) {
+                Ok(i) => match p_hdr.page_ty {
+                    PageKind::Leaf => {
+                        return Ok(BreadCumbs {
+                            breadcrumb,
+                            found: true,
+                        });
+                    }
+                    _ => {
+                        let child_page_id = if i < cells.len() {
+                            cells.get(i).unwrap().c_ptr.unwrap()
+                        } else {
+                            p_hdr.ptr
+                        };
+                        page_id = child_page_id;
+                    }
+                },
+                Err(i) => match p_hdr.page_ty {
+                    PageKind::Leaf => {
+                        return Ok(BreadCumbs {
+                            breadcrumb,
+                            found: false,
+                        });
+                    }
+                    _ => {
+                        let child_page_id = if i < cells.len() {
+                            cells.get(i).unwrap().c_ptr.unwrap()
+                        } else {
+                            p_hdr.ptr
+                        };
+                        page_id = child_page_id;
+                    }
+                },
+            }
+        }
+    }
+}
+/// Stack that stores the page ids while traversing to leaf
+struct BreadCumbs {
+    breadcrumb: Vec<u64>,
+    found: bool,
 }
 
