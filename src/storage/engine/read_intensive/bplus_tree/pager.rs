@@ -6,25 +6,33 @@ use std::{
     path::PathBuf,
 };
 
-use super::{PAGE_SIZE, slotted_page::Page};
+use super::{
+    PAGE_SIZE,
+    heap::Heap,
+    slotted_page::{Cell, Page},
+};
 
 pub(super) struct Pager {
-    pub tree_file: std::fs::File,
-    pub heap_file: std::fs::File,
+    pub index_file: std::fs::File,
+    pub heap: Heap,
     pub frames: RefCell<HashMap<u64, Page>>, // TODO: add eviction policy
     pub path_buf: std::path::PathBuf,
     pub next_available_id: u64,
 }
 
 impl Pager {
-    pub fn new(tree_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let tree_file = std::fs::File::open(&tree_path)?;
+    pub fn new(index_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let index_file = std::fs::File::open(&index_path)?;
         let heap_file = std::fs::File::open(&heap_path)?;
-        Ok(Pager {
-            tree_file,
+        let heap = Heap {
             heap_file,
+            path: heap_path,
+        };
+        Ok(Pager {
+            index_file,
+            heap,
             frames: HashMap::new().into(),
-            path_buf: tree_path,
+            path_buf: index_path,
             next_available_id: 0,
         })
     }
@@ -47,11 +55,24 @@ impl Pager {
     pub fn fetch(&self, id: u64) -> RefMut<'_, Page> {
         if !self.frames.borrow().contains_key(&id) {
             let mut buf = [0u8; PAGE_SIZE];
-            self.tree_file
+            self.index_file
                 .read_exact_at(&mut buf, Self::page_offset(id))
                 .unwrap();
         }
         RefMut::map(self.frames.borrow_mut(), |f| f.get_mut(&id).unwrap())
+    }
+
+    pub fn fetch_heap_data<'a>(
+        &self,
+        cell: &Cell,
+        data_record: &mut Vec<Vec<u8>>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(ref heap_ptr) = cell.h_ptr {
+            self.heap.get_record(heap_ptr.index, data_record)?;
+            Ok(())
+        } else {
+            Err("Couldn't find the header pointer".into())
+        }
     }
 
     fn page_offset(id: u64) -> u64 {

@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use crate::storage::engine::read_intensive::bplus_tree::header::HeapHeader;
+
 use super::{
     HEADER_SIZE, PAGE_SIZE, SLOT_SIZE,
     header::{PageHeader, PageKind},
@@ -21,14 +23,12 @@ impl Page {
                     let slot = self.slot(i);
                     let start = slot.cell_offset as usize;
                     let key = u64::from_le_bytes(self.data[start..start + 8].try_into().unwrap());
-                    let h_offset =
+                    let index =
                         u64::from_le_bytes(self.data[start + 8..start + 16].try_into().unwrap());
-                    let size =
-                        u64::from_le_bytes(self.data[start + 16..start + 24].try_into().unwrap());
                     cells.push(Cell {
                         key,
                         c_ptr: None,
-                        h_ptr: Some(HeapPointer { h_offset, size }),
+                        h_ptr: Some(HeapPointer { index }),
                     });
                 }
             }
@@ -50,13 +50,6 @@ impl Page {
         Ok(cells)
     }
 
-    pub fn fetch_heap_data(
-        &self,
-        cell: &Cell,
-        heap_file: &std::fs::File,
-    ) -> Result<&Vec<u8>, Box<dyn Error>> {
-        todo!()
-    }
     pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
             .ok_or("Couldn't deserialize the header".into())
@@ -74,9 +67,9 @@ impl Page {
 }
 
 /// starting offset (cell_offset) → \[Cell\] ← ending offset, 8 bytes
-struct CellPointer {
-    cell_offset: u16,
-    cell_size: u16,
+pub(super) struct CellPointer {
+    pub cell_offset: u16,
+    pub cell_size: u16,
 }
 
 pub(super) struct Cell {
@@ -88,7 +81,16 @@ pub(super) struct Cell {
     pub h_ptr: Option<HeapPointer>, // only PageKind::Leaf have this.
 }
 
-struct HeapPointer {
-    h_offset: u64,
-    size: u64,
+pub(super) struct HeapPointer {
+    pub index: u64,
+}
+
+pub(super) struct HeapPage {
+    data: [u8; super::heap::PAGE_SIZE],
+}
+
+impl HeapPage {
+    pub fn header(&self) -> Option<HeapHeader> {
+        HeapHeader::deserialize(&self.data)
+    }
 }

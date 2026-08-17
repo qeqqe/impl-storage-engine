@@ -5,6 +5,7 @@ use pager::Pager;
 use header::PageKind;
 
 pub(super) mod header;
+pub(super) mod heap;
 pub(super) mod pager;
 pub(super) mod slotted_page;
 
@@ -36,7 +37,7 @@ impl BplusTree {
     /// Traverses the tree, finds the cell content in page
     /// i.e. the offset & size of the actual data in the heap file
     /// returns a &Vec<u8> of the data, the callers can transmute it.
-    pub fn get(&self, key: u64) -> Result<&Vec<u8>, Box<dyn Error>> {
+    pub fn get(&self, key: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         let mut page_id = self.root_id;
         loop {
             let (cells, p_hdr) = {
@@ -52,7 +53,9 @@ impl BplusTree {
                         PageKind::Leaf => {
                             let cell = cells.get(i).unwrap();
                             let page = self.pager.fetch(page_id);
-                            page.fetch_heap_data(cell, &self.pager.heap_file)?;
+                            let mut data_records: Vec<Vec<u8>> = vec![vec![]];
+                            self.pager.fetch_heap_data(cell, &mut data_records)?;
+                            return Ok(data_records);
                         }
                         // Navigataion internal/root node
                         _ => {
