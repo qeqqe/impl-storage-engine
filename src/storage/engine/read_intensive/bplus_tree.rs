@@ -1,16 +1,85 @@
+use std::{error::Error, path::PathBuf};
+
+use pager::Pager;
+
+use header::PageKind;
+
 pub(super) mod header;
+pub(super) mod pager;
+pub(super) mod slotted_page;
 
-const PAGE_SIZE: usize = 4096;
-const HEADER_SIZE: usize = 8 + 2 + 2 + 1 + 1 + 8;
-const KEY_SIZE: usize = 8;
-const PTR_SIZE: usize = 8;
+pub(super) const PAGE_SIZE: usize = 4096;
+pub(super) const HEADER_SIZE: usize = 8 + 2 + 2 + 1 + 1 + 8;
+pub(super) const KEY_SIZE: usize = 8;
+pub(super) const PTR_SIZE: usize = 8;
 
-// max seperator keys in a page
+pub(super) const SLOT_SIZE: usize = 4; // cell_offset: u16 + cell_size: u16
+
+/// max seperator keys in a page
 const ORDER: usize = (PAGE_SIZE - HEADER_SIZE) / (KEY_SIZE + PTR_SIZE);
+const DEGREE: usize = ORDER / 2;
 const FANOUT: usize = ORDER + 1;
 
 struct BplusTree {
     root_id: u64,
+    pager: Pager,
 }
 
-impl BplusTree {}
+impl BplusTree {
+    pub fn new(tree_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let mut pager = Pager::new(tree_path, heap_path)?;
+        let root_id = pager.allocate();
+
+        Ok(Self { root_id, pager })
+    }
+
+    /// Traverses the tree, finds the cell content in page
+    /// i.e. the offset & size of the actual data in the heap file
+    /// returns a &Vec<u8> of the data, the callers can transmute it.
+    pub fn get(&self, key: u64) -> Result<&Vec<u8>, Box<dyn Error>> {
+        let mut page_id = self.root_id;
+        loop {
+            let (cells, p_hdr) = {
+                let page = self.pager.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells()?, p_hdr)
+            };
+
+            match cells.binary_search_by(|cell| cell.key.cmp(&key)) {
+                Ok(i) => {
+                    match p_hdr.page_ty {
+                        // Found it!
+                        PageKind::Leaf => {
+                            let cell = cells.get(i).unwrap();
+                            let page = self.pager.fetch(page_id);
+                            page.fetch_heap_data(cell, &self.pager.heap_file)?;
+                        }
+                        // Navigataion internal/root node
+                        _ => {
+                            let child_page_id = if i < cells.len() {
+                                cells.get(i).unwrap().c_ptr.unwrap()
+                            } else {
+                                p_hdr.id
+                            };
+
+                            page_id = child_page_id;
+                        }
+                    };
+                }
+                Err(i) => {
+                    if p_hdr.page_ty == PageKind::Leaf {
+                        return Err("Entry not found".into());
+                    }
+
+                    let child_page_id = if i < cells.len() {
+                        cells.get(i).unwrap().c_ptr.unwrap()
+                    } else {
+                        p_hdr.ptr
+                    };
+                    page_id = child_page_id;
+                }
+            }
+        }
+    }
+}
+
