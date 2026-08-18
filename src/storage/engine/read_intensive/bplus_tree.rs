@@ -84,8 +84,33 @@ impl BplusTree {
             }
         }
     }
+    // TODO: update the data records to contain more metadata about the
+    // inserted item for a better labled addressing of the data memebers,
+    // updates can mess up things if we're not careful withi it.
+    fn insert(&mut self, key: u64, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+        let mut breadcrumbs = self.breadcrumbs(key)?;
 
-    fn breadcrumbs(&self, key: u64) -> Result<BreadCumbs, Box<dyn Error>> {
+        if breadcrumbs.found {
+            return Err("Key already exists".into());
+        }
+
+        let mut breadcrumbs = breadcrumbs.breadcrumb;
+
+        let Some(page_id) = breadcrumbs.pop() else {
+            return Err("No page found".into());
+        };
+
+        // we first have to insert the data record into the heap file then we
+        // can have the offset of the data record that we can add to the cell's of
+        // index file current page
+        let heap_page_id = self.pager.heap.allocate();
+        let mut heap_page = self.pager.heap.fetch(heap_page_id)?;
+        heap_page.add_records(data_records)?;
+
+        todo!()
+    }
+
+    fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
         let mut breadcrumb: Vec<u64> = Vec::new();
 
         let mut page_id = self.root_id;
@@ -101,7 +126,7 @@ impl BplusTree {
             match cells.binary_search_by(|c| c.key.cmp(&key)) {
                 Ok(i) => match p_hdr.page_ty {
                     PageKind::Leaf => {
-                        return Ok(BreadCumbs {
+                        return Ok(BreadCrumbs {
                             breadcrumb,
                             found: true,
                         });
@@ -117,7 +142,7 @@ impl BplusTree {
                 },
                 Err(i) => match p_hdr.page_ty {
                     PageKind::Leaf => {
-                        return Ok(BreadCumbs {
+                        return Ok(BreadCrumbs {
                             breadcrumb,
                             found: false,
                         });
@@ -136,8 +161,7 @@ impl BplusTree {
     }
 }
 /// Stack that stores the page ids while traversing to leaf
-struct BreadCumbs {
+struct BreadCrumbs {
     breadcrumb: Vec<u64>,
     found: bool,
 }
-

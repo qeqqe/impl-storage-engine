@@ -27,7 +27,9 @@ impl Pager {
         let heap = Heap {
             heap_file,
             path: heap_path,
+            next_id: 0,
         };
+
         Ok(Pager {
             index_file,
             heap,

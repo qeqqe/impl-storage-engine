@@ -50,6 +50,8 @@ impl Page {
         Ok(cells)
     }
 
+    pub fn add_cell(&mut self) {}
+
     pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
             .ok_or("Couldn't deserialize the header".into())
@@ -86,11 +88,50 @@ pub(super) struct HeapPointer {
 }
 
 pub(super) struct HeapPage {
-    data: [u8; super::heap::PAGE_SIZE],
+    pub data: [u8; super::heap::PAGE_SIZE],
 }
 
 impl HeapPage {
     pub fn header(&self) -> Option<HeapHeader> {
         HeapHeader::deserialize(&self.data)
+    }
+
+    pub fn add_records(&mut self, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+        for record in data_records {
+            self.add_cell(record)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn add_cell(&mut self, data: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let d_len = data.len();
+        let Some(header) = self.header() else {
+            return Err("Couldn't deserialize the header".into());
+        };
+
+        let cell_ptr_offset = header.free_start;
+        let data_end_offset = header.free_end; // cell insertion point
+
+        let end = data_end_offset as usize;
+
+        // TODO: implement overflow pages.
+        let start = end
+            .checked_sub(d_len)
+            .filter(|&s| s >= cell_ptr_offset as usize)
+            .ok_or("Page overflow!")?;
+
+        self.data[start..end].clone_from_slice(&data);
+
+        let cell_ptr = CellPointer {
+            cell_offset: start as u16,
+            cell_size: d_len as u16,
+        };
+
+        let c_start = cell_ptr_offset as usize;
+        self.data[c_start..c_start + 2].clone_from_slice(&cell_ptr.cell_offset.to_le_bytes());
+        self.data[c_start + 2..c_start + 4].clone_from_slice(&cell_ptr.cell_size.to_le_bytes());
+
+        Ok(())
     }
 }

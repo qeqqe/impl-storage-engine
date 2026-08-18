@@ -9,6 +9,8 @@
 
 use std::{error::Error, os::unix::fs::FileExt};
 
+use super::slotted_page::HeapPage;
+
 use super::{header::HeapHeader, slotted_page::CellPointer};
 
 pub(super) const PAGE_SIZE: usize = 8192;
@@ -18,6 +20,7 @@ pub(super) const SLOT_SIZE: usize = 4;
 pub(super) struct Heap {
     pub heap_file: std::fs::File,
     pub path: std::path::PathBuf,
+    pub next_id: u64,
 }
 
 impl Heap {
@@ -56,6 +59,20 @@ impl Heap {
         }
 
         cell_ptr
+    }
+
+    pub fn fetch(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
+        let mut buf = [0u8; PAGE_SIZE];
+        self.heap_file
+            .read_exact_at(&mut buf, Self::page_offset(id))?;
+        Ok(HeapPage { data: buf })
+    }
+
+    pub fn allocate(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        // TODO: Add caching??
+        id
     }
 
     fn slot(&self, i: u16, buf: &[u8]) -> CellPointer {
