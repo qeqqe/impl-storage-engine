@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use std::{error::Error, path::PathBuf};
 
 use pager::Pager;
@@ -6,6 +8,7 @@ use header::PageKind;
 
 pub(super) mod header;
 pub(super) mod heap;
+pub(super) mod index;
 pub(super) mod pager;
 pub(super) mod slotted_page;
 
@@ -17,7 +20,12 @@ pub(super) const PTR_SIZE: usize = 8;
 pub(super) const SLOT_SIZE: usize = 4; // cell_offset: u16 + cell_size: u16
 
 /// max seperator keys in a page
-const ORDER: usize = (PAGE_SIZE - HEADER_SIZE) / (KEY_SIZE + PTR_SIZE);
+///
+/// `KEY_SIZE` + `PTR_SIZE` + `SLOT_SIZE` because for a single entry of a node
+/// there will be a cell pointer (`SLOT_SIZE`, 4 bytes) and the actual cell
+/// `KEY_SIZE` (the page id) `u64` 8 bytes AND `PTR_SIZE` `u64` 8 bytes  
+/// (ptr to the child node for internal nodes OR heap file page index for leaf nodes).
+const ORDER: usize = (PAGE_SIZE - HEADER_SIZE) / (KEY_SIZE + PTR_SIZE + SLOT_SIZE);
 const DEGREE: usize = ORDER / 2;
 const FANOUT: usize = ORDER + 1;
 
@@ -29,7 +37,7 @@ struct BplusTree {
 impl BplusTree {
     pub fn new(tree_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
         let mut pager = Pager::new(tree_path, heap_path)?;
-        let root_id = pager.allocate();
+        let root_id = pager.index.allocate();
 
         Ok(Self { root_id, pager })
     }
@@ -41,7 +49,7 @@ impl BplusTree {
         let mut page_id = self.root_id;
         loop {
             let (cells, p_hdr) = {
-                let page = self.pager.fetch(page_id);
+                let page = self.pager.index.fetch(page_id);
                 let p_hdr = page.header()?;
                 (page.get_cells()?, p_hdr)
             };
@@ -52,7 +60,7 @@ impl BplusTree {
                         // Found it!
                         PageKind::Leaf => {
                             let cell = cells.get(i).unwrap();
-                            let page = self.pager.fetch(page_id);
+                            let page = self.pager.index.fetch(page_id);
                             let mut data_records: Vec<Vec<u8>> = vec![vec![]];
                             self.pager.fetch_heap_data(cell, &mut data_records)?;
                             return Ok(data_records);
@@ -84,6 +92,7 @@ impl BplusTree {
             }
         }
     }
+
     // TODO: update the data records to contain more metadata about the
     // inserted item for a better labled addressing of the data memebers,
     // updates can mess up things if we're not careful withi it.
@@ -96,7 +105,7 @@ impl BplusTree {
 
         let mut breadcrumbs = breadcrumbs.breadcrumb;
 
-        let Some(page_id) = breadcrumbs.pop() else {
+        let Some(index_page_id) = breadcrumbs.pop() else {
             return Err("No page found".into());
         };
 
@@ -107,7 +116,15 @@ impl BplusTree {
         let mut heap_page = self.pager.heap.fetch(heap_page_id)?;
         heap_page.add_records(data_records)?;
 
-        todo!()
+        // now we can store the cell in the index page itself.
+        let mut page = self.pager.index.fetch(index_page_id);
+        let n_slots = page.add_cell(key, heap_page_id)?;
+
+        if n_slots >= ORDER {
+            // TODO: WE handle the overflow
+        }
+
+        Ok(())
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
@@ -117,7 +134,7 @@ impl BplusTree {
 
         loop {
             let (cells, p_hdr) = {
-                let page = self.pager.fetch(page_id);
+                let page = self.pager.index.fetch(page_id);
                 let p_hdr = page.header()?;
                 (page.get_cells()?, p_hdr)
             };

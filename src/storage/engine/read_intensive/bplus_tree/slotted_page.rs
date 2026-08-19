@@ -1,9 +1,9 @@
-use std::error::Error;
+use std::{error::Error, io::ErrorKind::NetworkDown};
 
 use crate::storage::engine::read_intensive::bplus_tree::header::HeapHeader;
 
 use super::{
-    HEADER_SIZE, PAGE_SIZE, SLOT_SIZE,
+    HEADER_SIZE, KEY_SIZE, PAGE_SIZE, PTR_SIZE, SLOT_SIZE,
     header::{PageHeader, PageKind},
 };
 
@@ -50,7 +50,81 @@ impl Page {
         Ok(cells)
     }
 
-    pub fn add_cell(&mut self) {}
+    pub fn add_cell(&mut self, key: u64, h_ptr: u64) -> Result<usize, Box<dyn Error>> {
+        let cell_size = KEY_SIZE + PTR_SIZE;
+        let mut hdr = self.header()?;
+
+        let c_ptr_offset = hdr.free_start;
+        let c_offset = hdr.free_end;
+
+        let end = c_offset as usize;
+        let start = end
+            .checked_sub(cell_size)
+            // 4 bytes because we still haven't updated the cell pointer array
+            // and this may lead to cell pointers and the cell collide when the cell pointer
+            // for this cell is added in (free_start + 4).
+            .filter(|&s| s >= c_ptr_offset as usize + 4)
+            .ok_or("Page overflow")?;
+
+        self.data[start..start + 8].copy_from_slice(&key.to_le_bytes());
+        self.data[start + 8..end].clone_from_slice(&h_ptr.to_le_bytes());
+
+        // now we can't just append the cell pointer at the free_start
+        // we need to keep the cell pointer ITSELF to be sorted in the
+        // cell pointers slot array. that'll require us to find the
+        // insertion point in the cell pointers array and SHIFT every
+        // cell pointer after the inserted cell pointer BY ONE.
+        // This operation will cost O(N logN), where N is the order of the
+        // Btree, log N is the binary search TC for searching insertion point,
+        // and in worst case you would need to shift around N-1 (only for Leaf
+        // nodes though as we know the first element will almost certainly never
+        // be shifted as the key wouldn't even lie in the this node), else N on
+        // internal/root node.
+
+        let cell_ptr = CellPointer {
+            cell_offset: start as u16,
+            cell_size: cell_size as u16,
+        };
+
+        let n_slots = ((c_ptr_offset - HEADER_SIZE as u16) / 4);
+        let mut lo = 0u16;
+        let mut hi = n_slots;
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let mid_slot = self.slot(mid);
+            let mid_key = u64::from_le_bytes(
+                self.data[mid_slot.cell_offset as usize
+                    ..mid_slot.cell_offset as usize + mid_slot.cell_size as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            if mid_key < key {
+                lo = mid + 1;
+            } else if mid_key > key {
+                hi = mid - 1;
+            }
+        }
+
+        let insert_idx = lo as usize;
+        let shift_from_start = insert_idx * 4 + HEADER_SIZE;
+        let shift_from_end = (n_slots as usize * 4) - (HEADER_SIZE);
+
+        self.data
+            .copy_within(shift_from_start..shift_from_end, shift_from_start + 4);
+
+        self.data[shift_from_start..shift_from_start + 2]
+            .copy_from_slice(&cell_ptr.cell_offset.to_le_bytes());
+        self.data[shift_from_start + 2..shift_from_start + 4]
+            .copy_from_slice(&cell_ptr.cell_size.to_le_bytes());
+
+        hdr.free_start += 4;
+        hdr.free_end -= start as u16;
+        hdr.serialize(&mut self.data[..HEADER_SIZE]);
+
+        Ok(n_slots as usize + 1)
+    }
 
     pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
@@ -74,6 +148,14 @@ pub(super) struct CellPointer {
     pub cell_size: u16,
 }
 
+/// Cell thats stored in a page and contains the actual data,
+/// grows from back in a page, referenced by the cell pointers
+/// IF an internal/root node, it references a child page
+/// else a leaf node and contains the page offset in the heap
+/// organized file of the data record.
+///
+/// In the heap file this contains the actual data record (not _records_, by design
+/// just meant to store one data member of the data record).
 pub(super) struct Cell {
     /// Key seperator, usually a specified PK (if not, it's not this module's concern).
     /// type u64, not a B+tree's concern for ensuring the type

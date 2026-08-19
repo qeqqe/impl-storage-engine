@@ -24,7 +24,7 @@ pub(super) struct Heap {
 }
 
 impl Heap {
-    pub fn get_record<'a>(
+    pub fn get_record(
         &self,
         id: u64,
         data_records: &mut Vec<Vec<u8>>,

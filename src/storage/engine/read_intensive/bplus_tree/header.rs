@@ -52,6 +52,11 @@ impl PageHeader {
     }
 }
 
+/// layout...
+/// \[header\]
+/// \[cell\_ptr\_1\]\[cell\_ptr\_2]←`free_start` ... `free_end`→\[cell\_2]\[cell\_1]
+///
+/// grows left→right;                           grows left←right;
 pub(super) struct HeapHeader {
     pub id: u64,         // 0..8
     pub free_start: u16, // 8..10
