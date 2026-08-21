@@ -49,8 +49,9 @@ impl BplusTree {
         let mut page_id = self.root_id;
         loop {
             let (cells, p_hdr) = {
-                let p_hdr = self.pager.index.fetch_header(page_id)?;
-                (self.pager.index.get_cells(page_id)?, p_hdr)
+                let page = self.pager.index.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells()?, p_hdr)
             };
 
             match cells.binary_search_by(|cell| cell.key.cmp(&key)) {
@@ -59,6 +60,7 @@ impl BplusTree {
                         // Found it!
                         PageKind::Leaf => {
                             let cell = cells.get(i).unwrap();
+                            let page = self.pager.index.fetch(page_id);
                             let mut data_records: Vec<Vec<u8>> = vec![vec![]];
                             self.pager.fetch_heap_data(cell, &mut data_records)?;
                             return Ok(data_records);
@@ -68,7 +70,7 @@ impl BplusTree {
                             let child_page_id = if i < cells.len() {
                                 cells.get(i).unwrap().c_ptr.unwrap()
                             } else {
-                                self.pager.index.rightmost_non_overflow_ptr(page_id)?
+                                p_hdr.id
                             };
 
                             page_id = child_page_id;
@@ -83,7 +85,7 @@ impl BplusTree {
                     let child_page_id = if i < cells.len() {
                         cells.get(i).unwrap().c_ptr.unwrap()
                     } else {
-                        self.pager.index.rightmost_non_overflow_ptr(page_id)?
+                        p_hdr.ptr
                     };
                     page_id = child_page_id;
                 }

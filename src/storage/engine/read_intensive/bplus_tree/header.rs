@@ -27,31 +27,6 @@ pub(super) struct PageHeader {
     /// NOTE: ptr will behave as a Rightmost Pointers
     /// when the page is an Internal/Root node
     /// else as a right sibling leaf pointer when a Leaf node...
-    /// ___
-    /// More importantly, ptr will also behave differently depending
-    /// on the flags.
-    /// As a convention, if the first bit of the flag is 1,
-    /// that would mean that THIS page is a primary page, else it's an overflow page.
-    ///
-    /// If the second bit of the flag is 1 that would mean that this page HAS an overflow page.
-    ///
-    /// So depending on the flags we have this combination (FB = flag bit)
-    ///
-    /// FB\[0\] == true && FB\[1\] == false: A primary page, where `ptr` indicates the child/sibling
-    /// page id depending on the PageKind.
-    ///
-    /// FB\[0\] == true && FB\[1\] == true: A primary page that has an overflow page, where `ptr`
-    /// indicated the page id of the overflow'd page.
-    ///
-    /// FB\[0\] == false && FB\[1\] == true: An overflow page that also has an overflow page, where `ptr`
-    /// indicated the page id of the overflow'd page.
-    ///
-    /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr`indicates
-    /// page id of the child/sibling depending on the PageKind.
-    ///
-    /// Little endian
-    ///
-    /// This way we can prevent extra data members for the overflow pages.
     pub ptr: u64, // 14..22
 } // 22
 
@@ -74,14 +49,6 @@ impl PageHeader {
         buf[12] = self.page_ty as u8;
         buf[13] = self.flags;
         buf[14..22].copy_from_slice(&self.ptr.to_le_bytes());
-    }
-
-    pub fn is_overflow_page(&self) -> bool {
-        self.flags & 1 == 1
-    }
-
-    pub fn has_overflow_page(&self) -> bool {
-        (self.flags >> 1) == 1
     }
 }
 
@@ -109,6 +76,25 @@ pub(super) struct HeapHeader {
     pub free_start: u16, // 8..10
     pub free_end: u16,   // 10..12
     pub flags: u8,       // 12
+    /// `ptr` will also behave differently depending
+    /// on the flags.
+    /// As a convention, if the first bit of the flag is 1,
+    /// that would mean that THIS page is a primary page, else it's an overflow page.
+    ///
+    /// If the second bit of the flag is 1 that would mean that this page HAS an overflow page.
+    ///
+    /// So depending on the flags we have this combination (FB = flag bit)
+    ///
+    /// FB\[0\] == true && FB\[1\] == false: A primary page, where `ptr` indicates nothing and shouldn't be read.
+    ///
+    /// FB\[0\] == true && FB\[1\] == true: A primary page that has an overflow page, where `ptr`
+    /// indicated the page id of the overflow'd page.
+    ///
+    /// FB\[0\] == false && FB\[1\] == true: An overflow page that has an overflow page, where `ptr`
+    /// indicated the page id of the overflow'd page.
+    ///
+    /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr` indicates nothing.
+    pub ptr: u64,
 } // 13
 
 impl HeapHeader {
@@ -118,6 +104,7 @@ impl HeapHeader {
             free_start: u16::from_le_bytes(buf[8..10].try_into().ok()?),
             free_end: u16::from_le_bytes(buf[10..12].try_into().ok()?),
             flags: u8::from_le(buf[12]),
+            ptr: u64::from_le_bytes(buf[13..21].try_into().ok()?),
         })
     }
 
@@ -126,5 +113,13 @@ impl HeapHeader {
         buf[8..10].copy_from_slice(&self.free_start.to_le_bytes());
         buf[10..12].copy_from_slice(&self.free_end.to_le_bytes());
         buf[12] = self.flags;
+    }
+
+    pub fn is_overflow_page(&self) -> bool {
+        self.flags & 1 == 1
+    }
+
+    pub fn has_overflow_page(&self) -> bool {
+        (self.flags >> 1) == 1
     }
 }

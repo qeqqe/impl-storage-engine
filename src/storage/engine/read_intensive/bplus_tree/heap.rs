@@ -75,6 +75,27 @@ impl Heap {
         id
     }
 
+    // pub fn add_cell(
+    //     &mut self,
+    //     page_id: u64,
+    //     key: u64,
+    //     h_ptr: u64,
+    // ) -> Result<usize, Box<dyn Error>> {
+    //     // IF the page is about to overflow we have to allocate a new page,
+    //     // mark the current page to indicate a it has an overflow child, update the `ptr`
+    //     // to point to the page id of the new allocated page, and finally update the allocated page
+    //     // header's `ptr` to contain the sibling/child point (the ptr that the page contained who now points
+    //     // to the new overflow'd page).
+    //  let page = self.fetch(page_id);
+    //
+    //
+    //
+    //     let p_hdr = page.header()?;
+    //
+    //     while p_hdr.has_overflow_page() {}
+    //     todo!()
+    // }
+
     fn slot(&self, i: u16, buf: &[u8]) -> CellPointer {
         let off = HEADER_SIZE + i as usize * SLOT_SIZE;
 

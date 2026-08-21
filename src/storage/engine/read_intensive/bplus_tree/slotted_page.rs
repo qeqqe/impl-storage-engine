@@ -203,7 +203,8 @@ impl HeapPage {
         let start = end
             .checked_sub(d_len)
             .filter(|&s| s >= cell_ptr_offset as usize)
-            .ok_or("Page overflow!")?;
+            .ok_or("Page overflow!")?; // because the cells are of same size and the order of
+        // the page is calculated accordingly... a index page will never overflow.
 
         self.data[start..end].clone_from_slice(&data);
 
