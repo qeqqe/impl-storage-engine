@@ -49,7 +49,9 @@ pub(super) struct PageHeader {
     /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr`indicates
     /// page id of the child/sibling depending on the PageKind.
     ///
-    /// This way we can make page header not have extra data for the overflow pages.
+    /// Little endian
+    ///
+    /// This way we can prevent extra data members for the overflow pages.
     pub ptr: u64, // 14..22
 } // 22
 
@@ -73,8 +75,18 @@ impl PageHeader {
         buf[13] = self.flags;
         buf[14..22].copy_from_slice(&self.ptr.to_le_bytes());
     }
+
+    pub fn is_overflow_page(&self) -> bool {
+        self.flags & 1 == 1
+    }
+
+    pub fn has_overflow_page(&self) -> bool {
+        (self.flags >> 1) == 1
+    }
 }
 
+///     (same for the page header)
+///
 ///     |----------------|
 ///     | file header    |   
 ///     |----------------|

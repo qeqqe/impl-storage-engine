@@ -1,10 +1,16 @@
 use std::{
     cell::{RefCell, RefMut},
     collections::HashMap,
+    error::Error,
     os::unix::fs::FileExt,
 };
 
-use super::{PAGE_SIZE, slotted_page::Page};
+use crate::storage::engine::read_intensive::bplus_tree::header::PageHeader;
+
+use super::{
+    PAGE_SIZE,
+    slotted_page::{Cell, Page},
+};
 
 pub(super) struct Index {
     pub index_file: std::fs::File,
@@ -27,6 +33,48 @@ impl Index {
         );
 
         id
+    }
+
+    /// the `Page` itself doensn't have the abilitiy to pull the
+    /// overflow page, so we will let Pager do the work to handle the
+    /// overflow pages...
+    pub fn get_cells(&self, id: u64) -> Result<Vec<Cell>, Box<dyn Error>> {
+        let mut p_id = id;
+        let mut cells = Vec::new();
+
+        let mut page = self.fetch(p_id);
+        let p_hdr = page.header()?;
+
+        while p_hdr.has_overflow_page() {
+            cells.extend(page.get_cells()?);
+            p_id = p_hdr.ptr;
+            page = self.fetch(p_id);
+        }
+
+        Ok(cells)
+    }
+
+    pub fn rightmost_non_overflow_ptr(&self, id: u64) -> Result<u64, Box<dyn Error>> {
+        let mut p_hdr = self.fetch_header(id)?;
+        while p_hdr.has_overflow_page() {
+            p_hdr = self.fetch_header(p_hdr.ptr)?;
+        }
+
+        Ok(p_hdr.ptr)
+    }
+
+    // TODO: this this really faster?
+    // we are invoking a disk i/o instead of referring the in memeory page.
+    pub fn fetch_header(&self, id: u64) -> Result<PageHeader, Box<dyn Error>> {
+        let mut buf = [0u8; super::HEADER_SIZE];
+
+        self.index_file
+            .read_exact_at(&mut buf, Self::page_offset(id));
+
+        match PageHeader::deserialize(&buf) {
+            Some(p_hdr) => Ok(p_hdr),
+            None => Err("Couldn't parse the header".into()),
+        }
     }
 
     pub fn fetch(&self, id: u64) -> RefMut<'_, Page> {
