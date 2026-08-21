@@ -126,6 +126,8 @@ impl Page {
         Ok(n_slots as usize + 1)
     }
 
+    pub fn handle_overflow_cell(&mut self) {}
+
     pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
             .ok_or("Couldn't deserialize the header".into())

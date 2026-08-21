@@ -23,10 +23,33 @@ pub(super) struct PageHeader {
     pub free_start: u16,   // 8..10
     pub free_end: u16,     // 10..12
     pub page_ty: PageKind, // 12
-    pub flags: u8,         // 13
+    pub flags: u8,         // 13, flag_bits[0] == primary_page, flage_bits[1] == has_overflow_page
     /// NOTE: ptr will behave as a Rightmost Pointers
     /// when the page is an Internal/Root node
-    /// else as a right sibling leaf pointer when a Leaf node
+    /// else as a right sibling leaf pointer when a Leaf node...
+    /// ___
+    /// More importantly, ptr will also behave differently depending
+    /// on the flags.
+    /// As a convention, if the first bit of the flag is 1,
+    /// that would mean that THIS page is a primary page, else it's an overflow page.
+    ///
+    /// If the second bit of the flag is 1 that would mean that this page HAS an overflow page.
+    ///
+    /// So depending on the flags we have this combination (FB = flag bit)
+    ///
+    /// FB\[0\] == true && FB\[1\] == false: A primary page, where `ptr` indicates the child/sibling
+    /// page id depending on the PageKind.
+    ///
+    /// FB\[0\] == true && FB\[1\] == true: A primary page that has an overflow page, where `ptr`
+    /// indicated the page id of the overflow'd page.
+    ///
+    /// FB\[0\] == false && FB\[1\] == true: An overflow page that also has an overflow page, where `ptr`
+    /// indicated the page id of the overflow'd page.
+    ///
+    /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr`indicates
+    /// page id of the child/sibling depending on the PageKind.
+    ///
+    /// This way we can make page header not have extra data for the overflow pages.
     pub ptr: u64, // 14..22
 } // 22
 
@@ -52,11 +75,23 @@ impl PageHeader {
     }
 }
 
-/// layout...
-/// \[header\]
-/// \[cell\_ptr\_1\]\[cell\_ptr\_2]←`free_start` ... `free_end`→\[cell\_2]\[cell\_1]
+///     |----------------|
+///     | file header    |   
+///     |----------------|
+///     | page header    |   
+///     |----------------|
+///     | cell pointer   |   |  4 bytes per cell pointer.  Sorted order.
+///     | array          |   |  Grows downward
+///     |                |   v
+///     |----------------|
+///     | unallocated    |
+///     | space          |
+///     |----------------|   ^  Grows upwards
+///     | cell content   |   |  Arbitrary order interspersed with freeblocks.
+///     | area           |   |  and free space fragments.
+///     |----------------|
 ///
-/// grows left→right;                           grows left←right;
+///     (referenced from sqlite)
 pub(super) struct HeapHeader {
     pub id: u64,         // 0..8
     pub free_start: u16, // 8..10

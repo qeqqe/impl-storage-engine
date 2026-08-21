@@ -26,8 +26,8 @@ pub(super) const SLOT_SIZE: usize = 4; // cell_offset: u16 + cell_size: u16
 /// `KEY_SIZE` (the page id) `u64` 8 bytes AND `PTR_SIZE` `u64` 8 bytes  
 /// (ptr to the child node for internal nodes OR heap file page index for leaf nodes).
 const ORDER: usize = (PAGE_SIZE - HEADER_SIZE) / (KEY_SIZE + PTR_SIZE + SLOT_SIZE);
-const DEGREE: usize = ORDER / 2;
 const FANOUT: usize = ORDER + 1;
+const DEGREE: usize = FANOUT / 2;
 
 struct BplusTree {
     root_id: u64,
@@ -117,14 +117,45 @@ impl BplusTree {
         heap_page.add_records(data_records)?;
 
         // now we can store the cell in the index page itself.
-        let mut page = self.pager.index.fetch(index_page_id);
-        let n_slots = page.add_cell(key, heap_page_id)?;
+        let n_slot = {
+            let mut page = self.pager.index.fetch(index_page_id);
+            page.add_cell(key, heap_page_id)?
+        };
 
-        if n_slots >= ORDER {
-            // TODO: WE handle the overflow
+        if n_slot > ORDER {
+            // index page was popped off so we need to re-insert
+            breadcrumbs.push(index_page_id);
+            match self.handle_overfull(&mut breadcrumbs)? {
+                Some(new_id) => self.root_id = new_id,
+                None => return Ok(()),
+            }
         }
 
         Ok(())
+    }
+
+    fn handle_overfull(
+        &mut self,
+        breadcrumbs: &mut Vec<u64>,
+    ) -> Result<Option<u64>, Box<dyn Error>> {
+        let Some(overflow_page_id) = breadcrumbs.pop() else {
+            return Err("Overflowed page now found!?".into());
+        };
+
+        let (overflow_hdr, overflow_cells) = {
+            let page = self.pager.index.fetch(overflow_page_id);
+            let hdr = page.header()?;
+            let cells = page.get_cells()?;
+            (hdr, cells)
+        };
+
+        let n = overflow_cells.len();
+        // keep these many elements remanining in the current page,
+        // (split + 1)th element will be promoted to the parent node and further
+        // will have the rest of the nodes as childs.
+        let split = n.div_ceil(2);
+
+        todo!()
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
