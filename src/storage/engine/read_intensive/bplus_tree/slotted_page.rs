@@ -64,7 +64,8 @@ impl Page {
             // and this may lead to cell pointers and the cell collide when the cell pointer
             // for this cell is added in (free_start + 4).
             .filter(|&s| s >= c_ptr_offset as usize + 4)
-            .ok_or("Page overflow")?;
+            .ok_or("Page overflow")?; // this should and will NEVER trigger as we have already
+        // calculated the max fanout and the split for overfull will be triggered before anything
 
         self.data[start..start + 8].copy_from_slice(&key.to_le_bytes());
         self.data[start + 8..end].clone_from_slice(&h_ptr.to_le_bytes());
@@ -176,8 +177,8 @@ pub(super) struct HeapPage {
 }
 
 impl HeapPage {
-    pub fn header(&self) -> Option<HeapHeader> {
-        HeapHeader::deserialize(&self.data)
+    pub fn header(&self) -> Result<HeapHeader, Box<dyn Error>> {
+        Ok(HeapHeader::deserialize(&self.data).ok_or("Couldn't deserialze the heap header")?)
     }
 
     pub fn add_records(&mut self, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
@@ -190,9 +191,7 @@ impl HeapPage {
 
     pub fn add_cell(&mut self, data: Vec<u8>) -> Result<(), Box<dyn Error>> {
         let d_len = data.len();
-        let Some(header) = self.header() else {
-            return Err("Couldn't deserialize the header".into());
-        };
+        let header = self.header()?;
 
         let cell_ptr_offset = header.free_start;
         let data_end_offset = header.free_end; // cell insertion point
@@ -203,8 +202,7 @@ impl HeapPage {
         let start = end
             .checked_sub(d_len)
             .filter(|&s| s >= cell_ptr_offset as usize)
-            .ok_or("Page overflow!")?; // because the cells are of same size and the order of
-        // the page is calculated accordingly... a index page will never overflow.
+            .ok_or("Heap page overflow!")?;
 
         self.data[start..end].clone_from_slice(&data);
 

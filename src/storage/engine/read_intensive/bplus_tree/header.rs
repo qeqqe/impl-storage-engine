@@ -1,3 +1,7 @@
+use crate::storage::engine::read_intensive::bplus_tree::slotted_page::HeapPage;
+
+pub(crate) const HEAP_HEADER_SIZE: usize = 21;
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum PageKind {
@@ -113,6 +117,35 @@ impl HeapHeader {
         buf[8..10].copy_from_slice(&self.free_start.to_le_bytes());
         buf[10..12].copy_from_slice(&self.free_end.to_le_bytes());
         buf[12] = self.flags;
+        buf[13..21].copy_from_slice(&self.ptr.to_le_bytes());
+    }
+
+    pub fn remaining_space(&self) -> usize {
+        (self.free_end as usize).saturating_sub(self.free_start as usize + super::heap::SLOT_SIZE)
+    }
+
+    pub fn new_primary(id: u64) -> Self {
+        HeapHeader {
+            id,
+            free_start: HEAP_HEADER_SIZE as u16,
+            free_end: super::heap::PAGE_SIZE as u16,
+            flags: 0x01, // first bit high = pirmary key
+            ptr: 0,
+        }
+    }
+
+    pub fn new_overflow(id: u64) -> Self {
+        HeapHeader {
+            id,
+            free_start: HEAP_HEADER_SIZE as u16,
+            free_end: super::heap::PAGE_SIZE as u16,
+            flags: 0x00, // first bit low = overflow key
+            ptr: 0,
+        }
+    }
+    pub fn set_has_overflow(&mut self, overflow_page_id: u64) {
+        self.flags |= 0x02; // second bit high = overflow
+        self.ptr = overflow_page_id;
     }
 
     pub fn is_overflow_page(&self) -> bool {
