@@ -138,24 +138,162 @@ impl BplusTree {
         &mut self,
         breadcrumbs: &mut Vec<u64>,
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        let Some(overflow_page_id) = breadcrumbs.pop() else {
-            return Err("Overflowed page now found!?".into());
+        let Some(overfull_page_id) = breadcrumbs.pop() else {
+            return Err("Overfull page not found!?".into());
         };
 
-        let (overflow_hdr, overflow_cells) = {
-            let page = self.pager.index.fetch(overflow_page_id);
+        let (overfull_hdr, overfull_cells) = {
+            let page = self.pager.index.fetch(overfull_page_id);
             let hdr = page.header()?;
             let cells = page.get_cells()?;
             (hdr, cells)
         };
 
-        let n = overflow_cells.len();
+        let n = overfull_cells.len();
         // keep these many elements remanining in the current page,
         // (split + 1)th element will be promoted to the parent node and further
         // will have the rest of the nodes as childs.
         let split = n.div_ceil(2);
 
-        todo!()
+        let left_cells = &overfull_cells[..split];
+        let promote_cell = &overfull_cells[split];
+        let right_cells = &overfull_cells[split + 1..];
+
+        let right_page_id = self.pager.index.allocate();
+
+        match overfull_hdr.page_ty {
+            PageKind::Leaf => {
+                let right_cells_with_promoted: Vec<_> = std::iter::once(promote_cell)
+                    .chain(right_cells.iter())
+                    .collect();
+
+                {
+                    let mut left_page = self.pager.index.fetch(overfull_page_id);
+                    left_page.rebuild_from_cells(
+                        left_cells,
+                        PageKind::Leaf,
+                        overfull_page_id,
+                        right_page_id,
+                    )?;
+                }
+
+                {
+                    let mut right_page = self.pager.index.fetch(right_page_id);
+                    let right_data: Vec<slotted_page::Cell> = right_cells_with_promoted
+                        .into_iter()
+                        .map(|c| slotted_page::Cell {
+                            key: c.key,
+                            c_ptr: c.c_ptr,
+                            h_ptr: c
+                                .h_ptr
+                                .as_ref()
+                                .map(|h| slotted_page::HeapPointer { index: h.index }),
+                        })
+                        .collect();
+                    right_page.rebuild_from_cells(
+                        &right_data,
+                        PageKind::Leaf,
+                        right_page_id,
+                        overfull_hdr.ptr,
+                    )?;
+                }
+            }
+            _ => {
+                let promote_c_ptr = promote_cell
+                    .c_ptr
+                    .ok_or("Internal promote cell missing c_ptr")?;
+
+                {
+                    let mut left_page = self.pager.index.fetch(overfull_page_id);
+                    left_page.rebuild_from_cells(
+                        left_cells,
+                        PageKind::Internal,
+                        overfull_page_id,
+                        promote_c_ptr,
+                    )?;
+                }
+
+                {
+                    let mut right_page = self.pager.index.fetch(right_page_id);
+                    let right_data: Vec<slotted_page::Cell> = right_cells
+                        .iter()
+                        .map(|c| slotted_page::Cell {
+                            key: c.key,
+                            c_ptr: c.c_ptr,
+                            h_ptr: None,
+                        })
+                        .collect();
+
+                    right_page.rebuild_from_cells(
+                        &right_data,
+                        PageKind::Internal,
+                        right_page_id,
+                        overfull_hdr.ptr,
+                    )?;
+                }
+            }
+        };
+
+        if let Some(&parent_id) = breadcrumbs.last() {
+            let n_slot = {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                let parent_hdr = parent_page.header()?;
+
+                let parent_cells = parent_page.get_cells()?;
+                let fixed_cells: Vec<slotted_page::Cell> = parent_cells
+                    .into_iter()
+                    .map(|c| slotted_page::Cell {
+                        key: c.key,
+                        c_ptr: c.c_ptr.map(|p| {
+                            if p == overfull_page_id {
+                                right_page_id
+                            } else {
+                                p
+                            }
+                        }),
+                        h_ptr: c.h_ptr,
+                    })
+                    .collect();
+
+                let fixed_ptr = if parent_hdr.ptr == overfull_page_id {
+                    right_page_id
+                } else {
+                    parent_hdr.ptr
+                };
+
+                parent_page.rebuild_from_cells(
+                    &fixed_cells,
+                    parent_hdr.page_ty,
+                    parent_id,
+                    fixed_ptr,
+                )?;
+
+                parent_page.add_cell(promote_cell.key, overfull_page_id)?
+            };
+
+            if n_slot > ORDER {
+                self.handle_overfull(breadcrumbs)
+            } else {
+                Ok(None)
+            }
+        } else {
+            let new_root_id = self.pager.index.allocate();
+            {
+                let mut root_page = self.pager.index.fetch(new_root_id);
+                root_page.init_header(new_root_id, PageKind::Root, right_page_id);
+                root_page.add_cell(promote_cell.key, overfull_page_id)?;
+            }
+
+            {
+                let mut left_page = self.pager.index.fetch(overfull_page_id);
+                let hdr = left_page.header()?;
+                if hdr.page_ty == PageKind::Root {
+                    left_page.set_header_kind(PageKind::Internal)?;
+                }
+            }
+
+            Ok(Some(new_root_id))
+        }
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {

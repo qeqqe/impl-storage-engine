@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, ops::Range};
 
 use super::{
     HEADER_SIZE, KEY_SIZE, PAGE_SIZE, PTR_SIZE, SLOT_SIZE,
@@ -36,7 +36,7 @@ impl Page {
                     let start = slot.cell_offset as usize;
                     let key = u64::from_le_bytes(self.data[start..start + 8].try_into().unwrap());
                     let c_ptr =
-                        u64::from_le_bytes(self.data[start + 8..start + 12].try_into().unwrap());
+                        u64::from_le_bytes(self.data[start + 8..start + 16].try_into().unwrap());
                     cells.push(Cell {
                         key,
                         c_ptr: Some(c_ptr),
@@ -132,7 +132,7 @@ impl Page {
             .ok_or("Couldn't deserialize the header".into())
     }
 
-    pub fn num_cell(&self) -> Result<usize, Box<dyn Error>> {
+    pub fn num_cells(&self) -> Result<usize, Box<dyn Error>> {
         let header = self.header()?;
         Ok((header.free_start as usize - HEADER_SIZE) / SLOT_SIZE)
     }
