@@ -1,10 +1,8 @@
-use std::{error::Error, io::ErrorKind::NetworkDown};
-
-use crate::storage::engine::read_intensive::bplus_tree::header::HeapHeader;
+use std::error::Error;
 
 use super::{
     HEADER_SIZE, KEY_SIZE, PAGE_SIZE, PTR_SIZE, SLOT_SIZE,
-    header::{PageHeader, PageKind},
+    header::{HeapHeader, PageHeader, PageKind},
 };
 
 pub(super) struct Page {
@@ -132,6 +130,92 @@ impl Page {
     pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
             .ok_or("Couldn't deserialize the header".into())
+    }
+
+    pub fn num_cell(&self) -> Result<usize, Box<dyn Error>> {
+        let header = self.header()?;
+        Ok((header.free_start as usize - HEADER_SIZE) / SLOT_SIZE)
+    }
+
+    pub fn init_header(&mut self, id: u64, page_ty: PageKind, ptr: u64) {
+        let hdr = PageHeader {
+            id,
+            free_start: HEADER_SIZE as u16,
+            free_end: PAGE_SIZE as u16,
+            page_ty,
+            flags: 0,
+            ptr,
+        };
+
+        hdr.serialize(&mut self.data[..HEADER_SIZE]);
+    }
+
+    // NOTE: This can be deemed as a performace hiccup as we are rewriting the whole page
+    // will add Tombstones for deleted a cell in furture
+    pub fn rebuild_from_cells(
+        &mut self,
+        cells: &[Cell],
+        page_ty: PageKind,
+        id: u64,
+        ptr: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        self.data = [0u8; PAGE_SIZE];
+        self.init_header(id, page_ty, ptr);
+
+        for cell in cells {
+            let value = match page_ty {
+                PageKind::Leaf => {
+                    cell.h_ptr
+                        .as_ref()
+                        .ok_or("Leaf cell missing heap pointer")?
+                        .index
+                }
+                _ => cell.c_ptr.ok_or("Internal cell missing child pointer")?,
+            };
+            self.add_cell(cell.key, value)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_cell_at(&mut self, idx: usize) -> Result<Cell, Box<dyn Error>> {
+        let hdr = self.header()?;
+        let all_cells = self.get_cells()?;
+
+        if idx >= all_cells.len() {
+            return Err("Cell index out of bounds".into());
+        }
+
+        let mut remaining: Vec<Cell> = Vec::with_capacity(all_cells.len() - 1);
+        let mut removed: Option<Cell> = None;
+
+        for (i, cell) in all_cells.into_iter().enumerate() {
+            if i == idx {
+                removed = Some(cell);
+            } else {
+                remaining.push(cell);
+            }
+        }
+
+        let removed = removed.ok_or("Cell not found at index")?;
+
+        self.rebuild_from_cells(&remaining, hdr.page_ty, hdr.id, hdr.ptr)?;
+
+        Ok(removed)
+    }
+
+    pub fn set_header_ptr(&mut self, ptr: u64) -> Result<(), Box<dyn Error>> {
+        let mut header = self.header()?;
+        header.ptr = ptr;
+        header.serialize(&mut self.data);
+        Ok(())
+    }
+
+    pub fn set_header_kind(&mut self, page_ty: PageKind) -> Result<(), Box<dyn Error>> {
+        let mut header = self.header()?;
+        header.page_ty = page_ty;
+        header.serialize(&mut self.data);
+        Ok(())
     }
 
     /// Returns the CellPointer for index i in the page
