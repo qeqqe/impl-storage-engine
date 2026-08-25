@@ -45,6 +45,23 @@ impl Index {
         RefMut::map(self.index_frames.borrow_mut(), |f| f.get_mut(&id).unwrap())
     }
 
+    pub fn flush(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
+        let frames = self.index_frames.borrow();
+        let page = frames.get(&id).ok_or("Page not in frames")?;
+        self.index_file
+            .write_all_at(&page.data, Self::page_offset(id));
+        Ok(())
+    }
+
+    pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
+        let frames = self.index_frames.borrow();
+        for (&id, page) in frames.iter() {
+            self.index_file
+                .write_all_at(&page.data, Self::page_offset(id));
+        }
+        Ok(())
+    }
+
     fn page_offset(id: u64) -> u64 {
         id * PAGE_SIZE as u64
     }
