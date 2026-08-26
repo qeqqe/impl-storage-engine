@@ -2,9 +2,9 @@
 
 use std::{error::Error, path::PathBuf};
 
-use pager::Pager;
-
 use header::PageKind;
+use pager::Pager;
+use slotted_page::Cell;
 
 pub(super) mod header;
 pub(super) mod heap;
@@ -138,50 +138,58 @@ impl BplusTree {
         &mut self,
         breadcrumbs: &mut Vec<u64>,
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        let Some(overfull_page_id) = breadcrumbs.pop() else {
-            return Err("Overfull page not found!?".into());
+        let Some(overflow_page_id) = breadcrumbs.pop() else {
+            return Err("Overflow page not found!?".into());
         };
 
-        let (overfull_hdr, overfull_cells) = {
-            let page = self.pager.index.fetch(overfull_page_id);
+        // collecting all the cells in the logical page, no matter if the page is
+        // overfull or not
+        let (overflow_hdr, overflow_cells) = {
+            let page = self.pager.index.fetch(overflow_page_id);
             let hdr = page.header()?;
             let cells = page.get_cells()?;
             (hdr, cells)
         };
 
-        let n = overfull_cells.len();
+        let n = overflow_cells.len();
         // keep these many elements remanining in the current page,
         // (split + 1)th element will be promoted to the parent node and further
         // will have the rest of the nodes as childs.
         let split = n.div_ceil(2);
 
-        let left_cells = &overfull_cells[..split];
-        let promote_cell = &overfull_cells[split];
-        let right_cells = &overfull_cells[split + 1..];
+        // Left cells are just remaning cells in the current overflow page
+        // The promote cell is prompted to the parent, further pointing to right cells*
+        // and left cells
+        // Right cells are the split from original and form a new page which is pointed by the
+        // promoted cell
+        let left_cells = &overflow_cells[..split];
+        let promote_cell = &overflow_cells[split];
+        let right_cells = &overflow_cells[split + 1..];
 
         let right_page_id = self.pager.index.allocate();
 
-        match overfull_hdr.page_ty {
+        match overflow_hdr.page_ty {
             PageKind::Leaf => {
+                // *On leaf level, the right cell's first element is the same as the promoted key
                 let right_cells_with_promoted: Vec<_> = std::iter::once(promote_cell)
                     .chain(right_cells.iter())
                     .collect();
 
                 {
-                    let mut left_page = self.pager.index.fetch(overfull_page_id);
+                    let mut left_page = self.pager.index.fetch(overflow_page_id);
                     left_page.rebuild_from_cells(
                         left_cells,
                         PageKind::Leaf,
-                        overfull_page_id,
+                        overflow_page_id,
                         right_page_id,
                     )?;
                 }
 
                 {
                     let mut right_page = self.pager.index.fetch(right_page_id);
-                    let right_data: Vec<slotted_page::Cell> = right_cells_with_promoted
+                    let right_data: Vec<Cell> = right_cells_with_promoted
                         .into_iter()
-                        .map(|c| slotted_page::Cell {
+                        .map(|c| Cell {
                             key: c.key,
                             c_ptr: c.c_ptr,
                             h_ptr: c
@@ -194,7 +202,7 @@ impl BplusTree {
                         &right_data,
                         PageKind::Leaf,
                         right_page_id,
-                        overfull_hdr.ptr,
+                        overflow_hdr.ptr,
                     )?;
                 }
             }
@@ -204,20 +212,20 @@ impl BplusTree {
                     .ok_or("Internal promote cell missing c_ptr")?;
 
                 {
-                    let mut left_page = self.pager.index.fetch(overfull_page_id);
+                    let mut left_page = self.pager.index.fetch(overflow_page_id);
                     left_page.rebuild_from_cells(
                         left_cells,
                         PageKind::Internal,
-                        overfull_page_id,
+                        overflow_page_id,
                         promote_c_ptr,
                     )?;
                 }
 
                 {
                     let mut right_page = self.pager.index.fetch(right_page_id);
-                    let right_data: Vec<slotted_page::Cell> = right_cells
+                    let right_data: Vec<Cell> = right_cells
                         .iter()
-                        .map(|c| slotted_page::Cell {
+                        .map(|c| Cell {
                             key: c.key,
                             c_ptr: c.c_ptr,
                             h_ptr: None,
@@ -228,7 +236,7 @@ impl BplusTree {
                         &right_data,
                         PageKind::Internal,
                         right_page_id,
-                        overfull_hdr.ptr,
+                        overflow_hdr.ptr,
                     )?;
                 }
             }
@@ -240,12 +248,12 @@ impl BplusTree {
                 let parent_hdr = parent_page.header()?;
 
                 let parent_cells = parent_page.get_cells()?;
-                let fixed_cells: Vec<slotted_page::Cell> = parent_cells
+                let fixed_cells: Vec<Cell> = parent_cells
                     .into_iter()
-                    .map(|c| slotted_page::Cell {
+                    .map(|c| Cell {
                         key: c.key,
                         c_ptr: c.c_ptr.map(|p| {
-                            if p == overfull_page_id {
+                            if p == overflow_page_id {
                                 right_page_id
                             } else {
                                 p
@@ -255,7 +263,7 @@ impl BplusTree {
                     })
                     .collect();
 
-                let fixed_ptr = if parent_hdr.ptr == overfull_page_id {
+                let fixed_ptr = if parent_hdr.ptr == overflow_page_id {
                     right_page_id
                 } else {
                     parent_hdr.ptr
@@ -268,7 +276,7 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
 
-                parent_page.add_cell(promote_cell.key, overfull_page_id)?
+                parent_page.add_cell(promote_cell.key, overflow_page_id)?
             };
 
             if n_slot > ORDER {
@@ -281,11 +289,11 @@ impl BplusTree {
             {
                 let mut root_page = self.pager.index.fetch(new_root_id);
                 root_page.init_header(new_root_id, PageKind::Root, right_page_id);
-                root_page.add_cell(promote_cell.key, overfull_page_id)?;
+                root_page.add_cell(promote_cell.key, overflow_page_id)?;
             }
 
             {
-                let mut left_page = self.pager.index.fetch(overfull_page_id);
+                let mut left_page = self.pager.index.fetch(overflow_page_id);
                 let hdr = left_page.header()?;
                 if hdr.page_ty == PageKind::Root {
                     left_page.set_header_kind(PageKind::Internal)?;
@@ -294,6 +302,112 @@ impl BplusTree {
 
             Ok(Some(new_root_id))
         }
+    }
+
+    fn delete(&mut self, key: u64) -> Result<(), Box<dyn Error>> {
+        let crumbs = self.breadcrumbs(key)?;
+
+        if !crumbs.found {
+            return Err("Key not found".into());
+        }
+
+        let mut trail = crumbs.breadcrumb;
+
+        let Some(leaf_id) = trail.pop() else {
+            return Err("Empty breadcrumb trail".into());
+        };
+
+        let (removed_cell, remaining) = {
+            let mut leaf_page = self.pager.index.fetch(leaf_id);
+            let cells = leaf_page.get_cells()?;
+            let idx = cells
+                .binary_search_by(|c| c.key.cmp(&key))
+                .map_err(|_| "Key not found in leaf page")?;
+
+            let removed = leaf_page.remove_cell_at(idx)?;
+            let n = leaf_page.num_cells()?;
+            (removed, n)
+        };
+
+        if leaf_id == self.root_id {
+            return Ok(());
+        }
+
+        // if there's no underfull just propogate the key up the tree
+        if remaining >= DEGREE {
+            self.propagate_key_update(key, leaf_id, &trail)?;
+            return Ok(());
+        }
+
+        self.handle_underfull(leaf_id, &mut trail)?;
+
+        Ok(())
+    }
+
+    fn propagate_key_update(
+        &mut self,
+        old_key: u64,
+        child_id: u64,
+        ancestors: &[u64],
+    ) -> Result<(), Box<dyn Error>> {
+        // we know that the left most cell's key of a leaf node will always
+        // be the same as the parent node's key pointing to it. so if we find
+        // any of the occurence of deleted key while propogating up the tree and we can
+        // replace it with `new_first_key`
+        let new_first_key = {
+            let leaf_page = self.pager.index.fetch(child_id);
+            let leaf_cells = leaf_page.get_cells()?;
+            match leaf_cells.first() {
+                Some(cell) => cell.key,
+                None => return Ok(()),
+            }
+        };
+
+        for &ancestor_id in ancestors.iter().rev() {
+            let found_idx = {
+                let page = self.pager.index.fetch(ancestor_id);
+                let cells = page.get_cells()?;
+                cells.binary_search_by(|c| c.key.cmp(&old_key)).ok()
+            };
+
+            if let Some(idx) = found_idx {
+                let mut page = self.pager.index.fetch(ancestor_id);
+                let hdr = page.header()?;
+                let cells = page.get_cells()?;
+
+                let updated_cells: Vec<Cell> = cells
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == idx {
+                            Cell {
+                                key: new_first_key,
+                                c_ptr: c.c_ptr,
+                                h_ptr: c.h_ptr,
+                            }
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+
+                page.rebuild_from_cells(&updated_cells, hdr.page_ty, hdr.id, hdr.ptr)?;
+
+                // there will only be ONE occurence at MAX so just
+                // exit when you find one.
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_underfull(
+        &mut self,
+        underfull_id: u64,
+        ancestor: &mut Vec<u64>,
+    ) -> Result<(), Box<dyn Error>> {
+        todo!()
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
