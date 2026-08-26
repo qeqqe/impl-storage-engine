@@ -296,7 +296,7 @@ impl BplusTree {
                 let mut left_page = self.pager.index.fetch(overflow_page_id);
                 let hdr = left_page.header()?;
                 if hdr.page_ty == PageKind::Root {
-                    left_page.set_header_kind(PageKind::Internal)?;
+                    left_page.set_page_kind(PageKind::Internal)?;
                 }
             }
 
@@ -807,8 +807,7 @@ impl BplusTree {
             }
         }
 
-        // check parent underfull now...
-        todo!()
+        self.check_parent_underfull(parent_id, ancestors)
     }
 
     fn merge_with_right(
@@ -943,8 +942,45 @@ impl BplusTree {
             }
         }
 
-        // check parent underfull now...
-        todo!()
+        self.check_parent_underfull(parent_id, ancestors)
+    }
+
+    fn check_parent_underfull(
+        &mut self,
+        parent_id: u64,
+        ancestors: &mut Vec<u64>,
+    ) -> Result<(), Box<dyn Error>> {
+        if parent_id == self.root_id {
+            let root_page = self.pager.index.fetch(parent_id);
+            let root_cells = root_page.get_cells()?;
+            let root_hdr = root_page.header()?;
+
+            if root_cells.is_empty() {
+                let new_root_id = root_hdr.ptr;
+                drop(root_page);
+
+                {
+                    let mut new_root = self.pager.index.fetch(new_root_id);
+                    new_root.set_page_kind(PageKind::Root)?;
+                }
+
+                self.root_id = new_root_id;
+            }
+
+            return Ok(());
+        }
+
+        let remaining = {
+            let page = self.pager.index.fetch(parent_id);
+            page.num_cells()?
+        };
+
+        if remaining < DEGREE {
+            ancestors.pop();
+            self.handle_underfull(parent_id, ancestors)?;
+        }
+
+        Ok(())
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {

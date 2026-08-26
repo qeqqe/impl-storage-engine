@@ -211,7 +211,7 @@ impl Page {
         Ok(())
     }
 
-    pub fn set_header_kind(&mut self, page_ty: PageKind) -> Result<(), Box<dyn Error>> {
+    pub fn set_page_kind(&mut self, page_ty: PageKind) -> Result<(), Box<dyn Error>> {
         let mut header = self.header()?;
         header.page_ty = page_ty;
         header.serialize(&mut self.data);
