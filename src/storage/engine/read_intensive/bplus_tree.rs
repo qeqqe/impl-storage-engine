@@ -448,27 +448,34 @@ impl BplusTree {
                     &underfull_hdr,
                 );
             }
+        }
 
-            if let Some(right_id) = right_sibling_id {
-                let right_cells = {
-                    let page = self.pager.index.fetch(right_id);
-                    page.get_cells()?
-                };
+        if let Some(right_id) = right_sibling_id {
+            let right_cells = {
+                let page = self.pager.index.fetch(right_id);
+                page.get_cells()?
+            };
 
-                if right_cells.len() > DEGREE {
-                    return self.redistribute_from_right(
-                        underfull_id,
-                        right_id,
-                        parent_id,
-                        child_idx,
-                        &underfull_hdr,
-                    );
-                }
+            if right_cells.len() > DEGREE {
+                return self.redistribute_from_right(
+                    underfull_id,
+                    right_id,
+                    parent_id,
+                    child_idx,
+                    &underfull_hdr,
+                );
             }
         }
 
-        todo!()
+        if let Some(left_id) = left_sibling_id {
+            self.merge_with_left(left_id, underfull_id, parent_id, child_idx, ancestors)?;
+        } else if let Some(right_id) = right_sibling_id {
+            self.merge_with_right(underfull_id, right_id, parent_id, child_idx, ancestors)?;
+        }
+
+        Ok(())
     }
+
     /// this method finds the left and right siblings of a given child page in the parent page's cells.
     /// It returns the index of the child in the parent's cells, and the IDs of the left and right
     /// siblings if they exist...
@@ -669,6 +676,275 @@ impl BplusTree {
         }
 
         Ok(())
+    }
+
+    fn merge_with_left(
+        &mut self,
+        left_id: u64,
+        underfull_id: u64,
+        parent_id: u64,
+        child_idx: usize,
+        ancestors: &mut Vec<u64>,
+    ) -> Result<(), Box<dyn Error>> {
+        let is_leaf = {
+            let page = self.pager.index.fetch(underfull_id);
+            page.header()?.page_ty == PageKind::Leaf
+        };
+
+        let separator_idx = child_idx - 1;
+
+        let (left_cells, left_hdr) = {
+            let page = self.pager.index.fetch(left_id);
+            (page.get_cells()?, page.header()?)
+        };
+        let (underfull_cells, underfull_hdr) = {
+            let page = self.pager.index.fetch(underfull_id);
+            (page.get_cells()?, page.header()?)
+        };
+
+        if is_leaf {
+            let mut merged: Vec<slotted_page::Cell> =
+                Vec::with_capacity(left_cells.len() + underfull_cells.len());
+            merged.extend(left_cells);
+            merged.extend(underfull_cells);
+
+            {
+                let mut left_page = self.pager.index.fetch(left_id);
+                left_page.rebuild_from_cells(
+                    &merged,
+                    PageKind::Leaf,
+                    left_id,
+                    underfull_hdr.ptr,
+                )?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+
+                parent_page.remove_cell_at(separator_idx)?;
+
+                let parent_hdr_after = parent_page.header()?;
+                let parent_cells_after = parent_page.get_cells()?;
+
+                let fixed_cells: Vec<slotted_page::Cell> = parent_cells_after
+                    .into_iter()
+                    .map(|c| slotted_page::Cell {
+                        key: c.key,
+                        c_ptr: c.c_ptr.map(|p| if p == underfull_id { left_id } else { p }),
+                        h_ptr: c.h_ptr,
+                    })
+                    .collect();
+
+                let fixed_ptr = if parent_hdr_after.ptr == underfull_id {
+                    left_id
+                } else {
+                    parent_hdr_after.ptr
+                };
+
+                parent_page.rebuild_from_cells(
+                    &fixed_cells,
+                    parent_hdr_after.page_ty,
+                    parent_id,
+                    fixed_ptr,
+                )?;
+            }
+        } else {
+            let parent_sep_key = {
+                let parent_page = self.pager.index.fetch(parent_id);
+                let parent_cells = parent_page.get_cells()?;
+                parent_cells[separator_idx].key
+            };
+
+            let mut merged: Vec<slotted_page::Cell> = Vec::new();
+            merged.extend(left_cells);
+            merged.push(slotted_page::Cell {
+                key: parent_sep_key,
+                c_ptr: Some(left_hdr.ptr),
+                h_ptr: None,
+            });
+            merged.extend(underfull_cells);
+
+            {
+                let mut left_page = self.pager.index.fetch(left_id);
+                left_page.rebuild_from_cells(
+                    &merged,
+                    PageKind::Internal,
+                    left_id,
+                    underfull_hdr.ptr,
+                )?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                let parent_hdr = parent_page.header()?;
+
+                parent_page.remove_cell_at(separator_idx)?;
+
+                let parent_hdr_after = parent_page.header()?;
+                let parent_cells_after = parent_page.get_cells()?;
+
+                let fixed_cells: Vec<slotted_page::Cell> = parent_cells_after
+                    .into_iter()
+                    .map(|c| slotted_page::Cell {
+                        key: c.key,
+                        c_ptr: c.c_ptr.map(|p| if p == underfull_id { left_id } else { p }),
+                        h_ptr: None,
+                    })
+                    .collect();
+
+                let fixed_ptr = if parent_hdr_after.ptr == underfull_id {
+                    left_id
+                } else {
+                    parent_hdr_after.ptr
+                };
+
+                parent_page.rebuild_from_cells(
+                    &fixed_cells,
+                    parent_hdr_after.page_ty,
+                    parent_id,
+                    fixed_ptr,
+                )?;
+            }
+        }
+
+        // check parent underfull now...
+        todo!()
+    }
+
+    fn merge_with_right(
+        &mut self,
+        underfull_id: u64,
+        right_id: u64,
+        parent_id: u64,
+        child_idx: usize,
+        ancestors: &mut Vec<u64>,
+    ) -> Result<(), Box<dyn Error>> {
+        let is_leaf = {
+            let page = self.pager.index.fetch(underfull_id);
+            page.header()?.page_ty == PageKind::Leaf
+        };
+
+        let separator_idx = child_idx;
+
+        let (underfull_cells, underfull_hdr) = {
+            let page = self.pager.index.fetch(underfull_id);
+            (page.get_cells()?, page.header()?)
+        };
+        let (right_cells, right_hdr) = {
+            let page = self.pager.index.fetch(right_id);
+            (page.get_cells()?, page.header()?)
+        };
+
+        if is_leaf {
+            let mut merged: Vec<slotted_page::Cell> =
+                Vec::with_capacity(underfull_cells.len() + right_cells.len());
+            merged.extend(underfull_cells);
+            merged.extend(right_cells);
+
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+                underfull_page.rebuild_from_cells(
+                    &merged,
+                    PageKind::Leaf,
+                    underfull_id,
+                    right_hdr.ptr,
+                )?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+
+                parent_page.remove_cell_at(separator_idx)?;
+
+                let parent_hdr_after = parent_page.header()?;
+                let parent_cells_after = parent_page.get_cells()?;
+
+                let fixed_cells: Vec<slotted_page::Cell> = parent_cells_after
+                    .into_iter()
+                    .map(|c| slotted_page::Cell {
+                        key: c.key,
+                        c_ptr: c
+                            .c_ptr
+                            .map(|p| if p == right_id { underfull_id } else { p }),
+                        h_ptr: c.h_ptr,
+                    })
+                    .collect();
+
+                let fixed_ptr = if parent_hdr_after.ptr == right_id {
+                    underfull_id
+                } else {
+                    parent_hdr_after.ptr
+                };
+
+                parent_page.rebuild_from_cells(
+                    &fixed_cells,
+                    parent_hdr_after.page_ty,
+                    parent_id,
+                    fixed_ptr,
+                )?;
+            }
+        } else {
+            let parent_sep_key = {
+                let parent_page = self.pager.index.fetch(parent_id);
+                let parent_cells = parent_page.get_cells()?;
+                parent_cells[separator_idx].key
+            };
+
+            let mut merged: Vec<slotted_page::Cell> = Vec::new();
+            merged.extend(underfull_cells);
+            merged.push(slotted_page::Cell {
+                key: parent_sep_key,
+                c_ptr: Some(underfull_hdr.ptr),
+                h_ptr: None,
+            });
+            merged.extend(right_cells);
+
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+                underfull_page.rebuild_from_cells(
+                    &merged,
+                    PageKind::Internal,
+                    underfull_id,
+                    right_hdr.ptr,
+                )?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+
+                parent_page.remove_cell_at(separator_idx)?;
+
+                let parent_hdr_after = parent_page.header()?;
+                let parent_cells_after = parent_page.get_cells()?;
+
+                let fixed_cells: Vec<slotted_page::Cell> = parent_cells_after
+                    .into_iter()
+                    .map(|c| slotted_page::Cell {
+                        key: c.key,
+                        c_ptr: c
+                            .c_ptr
+                            .map(|p| if p == right_id { underfull_id } else { p }),
+                        h_ptr: None,
+                    })
+                    .collect();
+
+                let fixed_ptr = if parent_hdr_after.ptr == right_id {
+                    underfull_id
+                } else {
+                    parent_hdr_after.ptr
+                };
+
+                parent_page.rebuild_from_cells(
+                    &fixed_cells,
+                    parent_hdr_after.page_ty,
+                    parent_id,
+                    fixed_ptr,
+                )?;
+            }
+        }
+
+        // check parent underfull now...
+        todo!()
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
