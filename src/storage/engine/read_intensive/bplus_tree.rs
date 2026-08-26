@@ -405,9 +405,69 @@ impl BplusTree {
     fn handle_underfull(
         &mut self,
         underfull_id: u64,
-        ancestor: &mut Vec<u64>,
+        ancestors: &mut Vec<u64>,
     ) -> Result<(), Box<dyn Error>> {
+        let Some(&parent_id) = ancestors.last() else {
+            return Ok(());
+        };
+
+        let (parent_hdr, parent_cells) = {
+            let parent_page = self.pager.index.fetch(parent_id);
+            let hdr = parent_page.header()?;
+            let cells = parent_page.get_cells()?;
+            (hdr, cells)
+        };
+
+        let (child_idx, left_sibling_id, right_sibling_id) =
+            self.find_siblings(underfull_id, &parent_cells, &parent_hdr)?;
+
         todo!()
+    }
+    /// this method finds the left and right siblings
+    /// of a given child page in the parent page's cells.
+    /// It returns the index of the child in the parent's
+    /// cells, and the IDs of the left and right siblings
+    /// if they exist...
+    fn find_siblings(
+        &self,
+        child_id: u64,
+        parent_cells: &[slotted_page::Cell],
+        parent_hdr: &header::PageHeader,
+    ) -> Result<(usize, Option<u64>, Option<u64>), Box<dyn Error>> {
+        let mut child_idx = parent_cells.len();
+
+        for (i, cell) in parent_cells.iter().enumerate() {
+            if cell.c_ptr == Some(child_id) {
+                child_idx = i;
+                break;
+            }
+        }
+
+        if child_idx == parent_cells.len() && parent_hdr.ptr == child_id {
+            let left = if parent_cells.is_empty() {
+                None
+            } else {
+                let last = parent_cells.len() - 1;
+                parent_cells[last].c_ptr
+            };
+            return Ok((child_idx, left, None));
+        }
+
+        let left = if child_idx > 0 {
+            parent_cells[child_idx - 1].c_ptr
+        } else {
+            None
+        };
+
+        let right = if child_idx + 1 < parent_cells.len() {
+            parent_cells[child_idx + 1].c_ptr
+        } else if child_idx < parent_cells.len() {
+            Some(parent_hdr.ptr)
+        } else {
+            None
+        };
+
+        Ok((child_idx, left, right))
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
