@@ -418,22 +418,66 @@ impl BplusTree {
             (hdr, cells)
         };
 
-        let (child_idx, left_sibling_id, right_sibling_id) =
-            self.find_siblings(underfull_id, &parent_cells, &parent_hdr)?;
+        let sibling = self.find_siblings(underfull_id, &parent_cells, &parent_hdr)?;
+
+        let child_idx = sibling.child_idx;
+        let left_sibling_id = sibling.left;
+        let right_sibling_id = sibling.right;
+
+        let underfull_cells = {
+            let page = self.pager.index.fetch(underfull_id);
+            page.get_cells()?
+        };
+        let underfull_hdr = {
+            let page = self.pager.index.fetch(underfull_id);
+            page.header()?
+        };
+
+        if let Some(left_id) = left_sibling_id {
+            let left_cells = {
+                let page = self.pager.index.fetch(left_id);
+                page.get_cells()?
+            };
+
+            if left_cells.len() > DEGREE {
+                return self.redistribute_from_left(
+                    left_id,
+                    underfull_id,
+                    parent_id,
+                    child_idx,
+                    &underfull_hdr,
+                );
+            }
+
+            if let Some(right_id) = right_sibling_id {
+                let right_cells = {
+                    let page = self.pager.index.fetch(right_id);
+                    page.get_cells()?
+                };
+
+                if right_cells.len() > DEGREE {
+                    return self.redistribute_from_right(
+                        underfull_id,
+                        right_id,
+                        parent_id,
+                        child_idx,
+                        &underfull_hdr,
+                    );
+                }
+            }
+        }
 
         todo!()
     }
-    /// this method finds the left and right siblings
-    /// of a given child page in the parent page's cells.
-    /// It returns the index of the child in the parent's
-    /// cells, and the IDs of the left and right siblings
-    /// if they exist...
+    /// this method finds the left and right siblings of a given child page in the parent page's cells.
+    /// It returns the index of the child in the parent's cells, and the IDs of the left and right
+    /// siblings if they exist...
     fn find_siblings(
         &self,
         child_id: u64,
         parent_cells: &[slotted_page::Cell],
         parent_hdr: &header::PageHeader,
-    ) -> Result<(usize, Option<u64>, Option<u64>), Box<dyn Error>> {
+    ) -> Result<Sibling, Box<dyn Error>> {
         let mut child_idx = parent_cells.len();
 
         for (i, cell) in parent_cells.iter().enumerate() {
@@ -450,7 +494,11 @@ impl BplusTree {
                 let last = parent_cells.len() - 1;
                 parent_cells[last].c_ptr
             };
-            return Ok((child_idx, left, None));
+            return Ok(Sibling {
+                child_idx,
+                left,
+                right: None,
+            });
         }
 
         let left = if child_idx > 0 {
@@ -467,7 +515,160 @@ impl BplusTree {
             None
         };
 
-        Ok((child_idx, left, right))
+        Ok(Sibling {
+            child_idx,
+            left,
+            right,
+        })
+    }
+
+    fn redistribute_from_left(
+        &mut self,
+        left_id: u64,
+        underfull_id: u64,
+        parent_id: u64,
+        child_idx: usize,
+        underfull_hdr: &header::PageHeader,
+    ) -> Result<(), Box<dyn Error>> {
+        let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
+
+        let (borrowed_cell, separator_idx) = {
+            let mut left_page = self.pager.index.fetch(left_id);
+            let left_cells = left_page.get_cells()?;
+            let last_idx = left_cells.len() - 1;
+            let cell = left_page.remove_cell_at(last_idx)?;
+            (cell, child_idx - 1)
+        };
+
+        if is_leaf {
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+                let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
+                underfull_page.add_cell(borrowed_cell.key, value)?;
+            }
+
+            let new_separator = {
+                let underfull_page = self.pager.index.fetch(underfull_id);
+                let cells = underfull_page.get_cells()?;
+                cells
+                    .first()
+                    .ok_or("Empty underfull after redistribute")?
+                    .key
+            };
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                parent_page.remove_cell_at(separator_idx)?;
+                parent_page.add_cell(new_separator, left_id)?;
+            }
+        } else {
+            let parent_sep_key = {
+                let parent_page = self.pager.index.fetch(parent_id);
+                let parent_cells = parent_page.get_cells()?;
+                parent_cells[separator_idx].key
+            };
+
+            let left_old_rightmost = {
+                let left_page = self.pager.index.fetch(left_id);
+                left_page.header()?.ptr
+            };
+
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+
+                let underfull_cells = underfull_page.get_cells()?;
+                let all_cells: Vec<slotted_page::Cell> = std::iter::once(slotted_page::Cell {
+                    key: parent_sep_key,
+                    c_ptr: Some(left_old_rightmost),
+                    h_ptr: None,
+                })
+                .chain(underfull_cells)
+                .collect();
+
+                underfull_page.rebuild_from_cells(
+                    &all_cells,
+                    underfull_hdr.page_ty,
+                    underfull_id,
+                    underfull_hdr.ptr,
+                )?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                parent_page.remove_cell_at(separator_idx)?;
+                parent_page.add_cell(borrowed_cell.key, left_id)?;
+            }
+
+            {
+                let mut left_page = self.pager.index.fetch(left_id);
+                if let Some(c) = borrowed_cell.c_ptr {
+                    left_page.set_header_ptr(c)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn redistribute_from_right(
+        &mut self,
+        underfull_id: u64,
+        right_id: u64,
+        parent_id: u64,
+        child_idx: usize,
+        underfull_hdr: &header::PageHeader,
+    ) -> Result<(), Box<dyn Error>> {
+        let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
+
+        let borrowed_cell = {
+            let mut right_page = self.pager.index.fetch(right_id);
+            right_page.remove_cell_at(0)?
+        };
+
+        let separator_idx = child_idx;
+
+        if is_leaf {
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+                let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
+                underfull_page.add_cell(borrowed_cell.key, value)?;
+            }
+
+            let new_separator = {
+                let right_page = self.pager.index.fetch(right_id);
+                let cells = right_page.get_cells()?;
+                cells.first().ok_or("Empty right after redistribute")?.key
+            };
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                parent_page.remove_cell_at(separator_idx)?;
+                parent_page.add_cell(new_separator, underfull_id)?;
+            }
+        } else {
+            let parent_sep_key = {
+                let parent_page = self.pager.index.fetch(parent_id);
+                let parent_cells = parent_page.get_cells()?;
+                parent_cells[separator_idx].key
+            };
+
+            let borrowed_left_child = borrowed_cell.c_ptr.ok_or("Missing c_ptr")?;
+
+            {
+                let mut underfull_page = self.pager.index.fetch(underfull_id);
+                let old_ptr = underfull_page.header()?.ptr;
+                underfull_page.add_cell(parent_sep_key, old_ptr)?;
+                underfull_page.set_header_ptr(borrowed_left_child)?;
+            }
+
+            {
+                let mut parent_page = self.pager.index.fetch(parent_id);
+                parent_page.remove_cell_at(separator_idx)?;
+                parent_page.add_cell(borrowed_cell.key, underfull_id)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
@@ -524,4 +725,10 @@ impl BplusTree {
 struct BreadCrumbs {
     breadcrumb: Vec<u64>,
     found: bool,
+}
+
+struct Sibling {
+    child_idx: usize,
+    left: Option<u64>,
+    right: Option<u64>,
 }
