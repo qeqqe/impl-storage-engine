@@ -22,7 +22,7 @@ impl PageKind {
 }
 
 #[repr(C)]
-pub(super) struct PageHeader {
+pub(super) struct IndexHeader {
     pub id: u64,           // 0..8
     pub free_start: u16,   // 8..10
     pub free_end: u16,     // 10..12
@@ -34,9 +34,9 @@ pub(super) struct PageHeader {
     pub ptr: u64, // 14..22
 } // 22
 
-impl PageHeader {
+impl IndexHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        Some(PageHeader {
+        Some(IndexHeader {
             id: u64::from_le_bytes(buf[0..8].try_into().ok()?),
             free_start: u16::from_le_bytes(buf[8..10].try_into().ok()?),
             free_end: u16::from_le_bytes(buf[10..12].try_into().ok()?),
@@ -53,6 +53,18 @@ impl PageHeader {
         buf[12] = self.page_ty as u8;
         buf[13] = self.flags;
         buf[14..22].copy_from_slice(&self.ptr.to_le_bytes());
+    }
+
+    pub fn is_root_leaf(&self) -> bool {
+        self.flags & 0x01 == 0x01
+    }
+
+    pub fn set_root_leaf(&mut self) {
+        self.flags |= 0x01;
+    }
+
+    pub fn clear_root_leaf(&mut self) {
+        self.flags &= !0x01;
     }
 }
 
@@ -99,7 +111,7 @@ pub(super) struct HeapHeader {
     ///
     /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr` indicates nothing.
     pub ptr: u64,
-} // 13
+} // 21
 
 impl HeapHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {

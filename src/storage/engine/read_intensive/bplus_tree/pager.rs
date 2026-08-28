@@ -9,8 +9,20 @@ pub(super) struct Pager {
 
 impl Pager {
     pub fn new(index_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let index_file = std::fs::File::open(&index_path)?;
-        let heap_file = std::fs::File::open(&heap_path)?;
+        let heap_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&heap_path)?;
+
+        let index_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&index_path)?;
+
         let heap = Heap {
             heap_file,
             path: heap_path,

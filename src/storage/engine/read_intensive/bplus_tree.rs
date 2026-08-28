@@ -35,9 +35,16 @@ struct BplusTree {
 }
 
 impl BplusTree {
-    pub fn new(tree_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let mut pager = Pager::new(tree_path, heap_path)?;
-        let root_id = pager.index.allocate();
+    pub fn new(index_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let mut pager = Pager::new(index_path, heap_path)?;
+        let root_id = pager.index.allocate(PageKind::Root);
+
+        {
+            let mut root_page = pager.index.fetch(root_id);
+            let mut hdr = root_page.header()?;
+            hdr.set_root_leaf();
+            hdr.serialize(&mut root_page.data[..HEADER_SIZE]);
+        }
 
         Ok(Self { root_id, pager })
     }
@@ -54,31 +61,27 @@ impl BplusTree {
                 (page.get_cells()?, p_hdr)
             };
 
+            let is_leaf_level = p_hdr.page_ty == PageKind::Leaf
+                || (p_hdr.page_ty == PageKind::Root && p_hdr.is_root_leaf());
+
             match cells.binary_search_by(|cell| cell.key.cmp(&key)) {
                 Ok(i) => {
-                    match p_hdr.page_ty {
-                        // Found it!
-                        PageKind::Leaf => {
-                            let cell = cells.get(i).unwrap();
-                            let page = self.pager.index.fetch(page_id);
-                            let mut data_records: Vec<Vec<u8>> = vec![vec![]];
-                            self.pager.fetch_heap_data(cell, &mut data_records)?;
-                            return Ok(data_records);
-                        }
-                        // Navigataion internal/root node
-                        _ => {
-                            let child_page_id = if i < cells.len() {
-                                cells.get(i).unwrap().c_ptr.unwrap()
-                            } else {
-                                p_hdr.id
-                            };
-
-                            page_id = child_page_id;
-                        }
-                    };
+                    if is_leaf_level {
+                        let cell = cells.get(i).unwrap();
+                        let mut data_records: Vec<Vec<u8>> = vec![];
+                        self.pager.fetch_heap_data(cell, &mut data_records)?;
+                        return Ok(data_records);
+                    } else {
+                        let child_page_id = if i + 1 < cells.len() {
+                            cells.get(i + 1).unwrap().c_ptr.unwrap()
+                        } else {
+                            p_hdr.ptr
+                        };
+                        page_id = child_page_id;
+                    }
                 }
                 Err(i) => {
-                    if p_hdr.page_ty == PageKind::Leaf {
+                    if is_leaf_level {
                         return Err("Entry not found".into());
                     }
 
@@ -115,6 +118,7 @@ impl BplusTree {
         let heap_page_id = self.pager.heap.allocate();
         let mut heap_page = self.pager.heap.fetch(heap_page_id)?;
         heap_page.add_records(data_records)?;
+        self.pager.heap.write_page(heap_page_id, &heap_page)?;
 
         // now we can store the cell in the index page itself.
         let n_slot = {
@@ -122,7 +126,7 @@ impl BplusTree {
             page.add_cell(key, heap_page_id)?
         };
 
-        if n_slot > ORDER {
+        if n_slot >= ORDER {
             // index page was popped off so we need to re-insert
             breadcrumbs.push(index_page_id);
             match self.handle_overfull(&mut breadcrumbs)? {
@@ -166,79 +170,84 @@ impl BplusTree {
         let promote_cell = &overflow_cells[split];
         let right_cells = &overflow_cells[split + 1..];
 
-        let right_page_id = self.pager.index.allocate();
+        let is_leaf_level = overflow_hdr.page_ty == PageKind::Leaf
+            || (overflow_hdr.page_ty == PageKind::Root && overflow_hdr.is_root_leaf());
 
-        match overflow_hdr.page_ty {
-            PageKind::Leaf => {
-                // *On leaf level, the right cell's first element is the same as the promoted key
-                let right_cells_with_promoted: Vec<_> = std::iter::once(promote_cell)
-                    .chain(right_cells.iter())
+        let right_page_kind = if is_leaf_level {
+            PageKind::Leaf
+        } else {
+            PageKind::Internal
+        };
+        let right_page_id = self.pager.index.allocate(right_page_kind);
+
+        if is_leaf_level {
+            // *On leaf level, the right cell's first element is the same as the promoted key
+            let right_cells_with_promoted: Vec<_> = std::iter::once(promote_cell)
+                .chain(right_cells.iter())
+                .collect();
+
+            {
+                let mut left_page = self.pager.index.fetch(overflow_page_id);
+                left_page.rebuild_from_cells(
+                    left_cells,
+                    PageKind::Leaf,
+                    overflow_page_id,
+                    right_page_id,
+                )?;
+            }
+
+            {
+                let mut right_page = self.pager.index.fetch(right_page_id);
+                let right_data: Vec<Cell> = right_cells_with_promoted
+                    .into_iter()
+                    .map(|c| Cell {
+                        key: c.key,
+                        c_ptr: c.c_ptr,
+                        h_ptr: c
+                            .h_ptr
+                            .as_ref()
+                            .map(|h| slotted_page::HeapPointer { index: h.index }),
+                    })
+                    .collect();
+                right_page.rebuild_from_cells(
+                    &right_data,
+                    PageKind::Leaf,
+                    right_page_id,
+                    overflow_hdr.ptr,
+                )?;
+            }
+        } else {
+            let promote_c_ptr = promote_cell
+                .c_ptr
+                .ok_or("Internal promote cell missing c_ptr")?;
+
+            {
+                let mut left_page = self.pager.index.fetch(overflow_page_id);
+                left_page.rebuild_from_cells(
+                    left_cells,
+                    PageKind::Internal,
+                    overflow_page_id,
+                    promote_c_ptr,
+                )?;
+            }
+
+            {
+                let mut right_page = self.pager.index.fetch(right_page_id);
+                let right_data: Vec<Cell> = right_cells
+                    .iter()
+                    .map(|c| Cell {
+                        key: c.key,
+                        c_ptr: c.c_ptr,
+                        h_ptr: None,
+                    })
                     .collect();
 
-                {
-                    let mut left_page = self.pager.index.fetch(overflow_page_id);
-                    left_page.rebuild_from_cells(
-                        left_cells,
-                        PageKind::Leaf,
-                        overflow_page_id,
-                        right_page_id,
-                    )?;
-                }
-
-                {
-                    let mut right_page = self.pager.index.fetch(right_page_id);
-                    let right_data: Vec<Cell> = right_cells_with_promoted
-                        .into_iter()
-                        .map(|c| Cell {
-                            key: c.key,
-                            c_ptr: c.c_ptr,
-                            h_ptr: c
-                                .h_ptr
-                                .as_ref()
-                                .map(|h| slotted_page::HeapPointer { index: h.index }),
-                        })
-                        .collect();
-                    right_page.rebuild_from_cells(
-                        &right_data,
-                        PageKind::Leaf,
-                        right_page_id,
-                        overflow_hdr.ptr,
-                    )?;
-                }
-            }
-            _ => {
-                let promote_c_ptr = promote_cell
-                    .c_ptr
-                    .ok_or("Internal promote cell missing c_ptr")?;
-
-                {
-                    let mut left_page = self.pager.index.fetch(overflow_page_id);
-                    left_page.rebuild_from_cells(
-                        left_cells,
-                        PageKind::Internal,
-                        overflow_page_id,
-                        promote_c_ptr,
-                    )?;
-                }
-
-                {
-                    let mut right_page = self.pager.index.fetch(right_page_id);
-                    let right_data: Vec<Cell> = right_cells
-                        .iter()
-                        .map(|c| Cell {
-                            key: c.key,
-                            c_ptr: c.c_ptr,
-                            h_ptr: None,
-                        })
-                        .collect();
-
-                    right_page.rebuild_from_cells(
-                        &right_data,
-                        PageKind::Internal,
-                        right_page_id,
-                        overflow_hdr.ptr,
-                    )?;
-                }
+                right_page.rebuild_from_cells(
+                    &right_data,
+                    PageKind::Internal,
+                    right_page_id,
+                    overflow_hdr.ptr,
+                )?;
             }
         };
 
@@ -279,13 +288,13 @@ impl BplusTree {
                 parent_page.add_cell(promote_cell.key, overflow_page_id)?
             };
 
-            if n_slot > ORDER {
+            if n_slot >= ORDER {
                 self.handle_overfull(breadcrumbs)
             } else {
                 Ok(None)
             }
         } else {
-            let new_root_id = self.pager.index.allocate();
+            let new_root_id = self.pager.index.allocate(PageKind::Root);
             {
                 let mut root_page = self.pager.index.fetch(new_root_id);
                 root_page.init_header(new_root_id, PageKind::Root, right_page_id);
@@ -483,7 +492,7 @@ impl BplusTree {
         &self,
         child_id: u64,
         parent_cells: &[slotted_page::Cell],
-        parent_hdr: &header::PageHeader,
+        parent_hdr: &header::IndexHeader,
     ) -> Result<Sibling, Box<dyn Error>> {
         let mut child_idx = parent_cells.len();
 
@@ -535,7 +544,7 @@ impl BplusTree {
         underfull_id: u64,
         parent_id: u64,
         child_idx: usize,
-        underfull_hdr: &header::PageHeader,
+        underfull_hdr: &header::IndexHeader,
     ) -> Result<(), Box<dyn Error>> {
         let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
 
@@ -623,7 +632,7 @@ impl BplusTree {
         right_id: u64,
         parent_id: u64,
         child_idx: usize,
-        underfull_hdr: &header::PageHeader,
+        underfull_hdr: &header::IndexHeader,
     ) -> Result<(), Box<dyn Error>> {
         let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
 
@@ -995,40 +1004,41 @@ impl BplusTree {
                 (page.get_cells()?, p_hdr)
             };
 
-            breadcrumb.push(p_hdr.id);
+            breadcrumb.push(page_id);
+
+            let is_leaf_level = p_hdr.page_ty == PageKind::Leaf
+                || (p_hdr.page_ty == PageKind::Root && p_hdr.is_root_leaf());
+
             match cells.binary_search_by(|c| c.key.cmp(&key)) {
-                Ok(i) => match p_hdr.page_ty {
-                    PageKind::Leaf => {
+                Ok(_i) => {
+                    if is_leaf_level {
                         return Ok(BreadCrumbs {
                             breadcrumb,
                             found: true,
                         });
                     }
-                    _ => {
-                        let child_page_id = if i < cells.len() {
-                            cells.get(i).unwrap().c_ptr.unwrap()
-                        } else {
-                            p_hdr.ptr
-                        };
-                        page_id = child_page_id;
-                    }
-                },
-                Err(i) => match p_hdr.page_ty {
-                    PageKind::Leaf => {
+                    let child_page_id = if _i + 1 < cells.len() {
+                        cells.get(_i + 1).unwrap().c_ptr.unwrap()
+                    } else {
+                        p_hdr.ptr
+                    };
+                    page_id = child_page_id;
+                }
+                Err(i) => {
+                    if is_leaf_level {
                         return Ok(BreadCrumbs {
                             breadcrumb,
                             found: false,
                         });
                     }
-                    _ => {
-                        let child_page_id = if i < cells.len() {
-                            cells.get(i).unwrap().c_ptr.unwrap()
-                        } else {
-                            p_hdr.ptr
-                        };
-                        page_id = child_page_id;
-                    }
-                },
+
+                    let child_page_id = if i < cells.len() {
+                        cells.get(i).unwrap().c_ptr.unwrap()
+                    } else {
+                        p_hdr.ptr
+                    };
+                    page_id = child_page_id;
+                }
             }
         }
     }
@@ -1043,4 +1053,243 @@ struct Sibling {
     child_idx: usize,
     left: Option<u64>,
     right: Option<u64>,
+}
+
+#[cfg(test)]
+mod test {
+    use std::fs;
+
+    use super::*;
+
+    fn get_btree_in(dir: &std::path::Path) -> BplusTree {
+        let heap_path = dir.join("heap_file.db");
+        let index_path = dir.join("index_file.db");
+        BplusTree::new(index_path, heap_path).unwrap()
+    }
+
+    #[test]
+    fn single_insert_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"hello".to_vec()]).unwrap();
+
+        let result = btree.get(1u64).unwrap();
+        assert_eq!(result, vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn insert_and_get_multiple_keys_in_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(5u64, vec![b"five".to_vec()]).unwrap();
+        btree.insert(3u64, vec![b"three".to_vec()]).unwrap();
+        btree.insert(7u64, vec![b"seven".to_vec()]).unwrap();
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+
+        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
+        assert_eq!(btree.get(3u64).unwrap(), vec![b"three".to_vec()]);
+        assert_eq!(btree.get(5u64).unwrap(), vec![b"five".to_vec()]);
+        assert_eq!(btree.get(7u64).unwrap(), vec![b"seven".to_vec()]);
+    }
+
+    #[test]
+    fn get_nonexistent_key_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+
+        let result = btree.get(999u64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_insert_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        let result = btree.insert(1u64, vec![b"one again".to_vec()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn insert_and_get_multiple_data_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let records = vec![b"field1".to_vec(), b"field2".to_vec(), b"field3".to_vec()];
+        btree.insert(42u64, records.clone()).unwrap();
+
+        let result = btree.get(42u64).unwrap();
+        assert_eq!(result, records);
+    }
+
+    #[test]
+    fn delete_from_root_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(2u64, vec![b"two".to_vec()]).unwrap();
+        btree.insert(3u64, vec![b"three".to_vec()]).unwrap();
+
+        btree.delete(2u64).unwrap();
+
+        assert!(btree.get(2u64).is_err());
+        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
+        assert_eq!(btree.get(3u64).unwrap(), vec![b"three".to_vec()]);
+    }
+
+    #[test]
+    fn delete_nonexistent_key_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        let result = btree.delete(999u64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_all_from_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(2u64, vec![b"two".to_vec()]).unwrap();
+
+        btree.delete(1u64).unwrap();
+        btree.delete(2u64).unwrap();
+
+        assert!(btree.get(1u64).is_err());
+        assert!(btree.get(2u64).is_err());
+    }
+
+    #[test]
+    fn insert_ascending_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        for i in 1..=20u64 {
+            btree
+                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 1..=20u64 {
+            let result = btree.get(i).unwrap();
+            assert_eq!(result, vec![format!("val-{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn insert_descending_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        for i in (1..=20u64).rev() {
+            btree
+                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 1..=20u64 {
+            let result = btree.get(i).unwrap();
+            assert_eq!(result, vec![format!("val-{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn many_inserts_cause_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = ORDER as u64 * 4;
+        for i in 1..=count {
+            btree
+                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .unwrap();
+
+            for j in 1..=i {
+                let result = btree.get(j);
+                assert!(
+                    result.is_ok(),
+                    "Failed to get key {} after inserting key {} (count={})",
+                    j,
+                    i,
+                    i
+                );
+                assert_eq!(
+                    result.unwrap(),
+                    vec![format!("data-{}", j).into_bytes()],
+                    "Wrong data for key {} after inserting key {}",
+                    j,
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_delete_reinsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(1u64, vec![b"first".to_vec()]).unwrap();
+        btree.delete(1u64).unwrap();
+        btree.insert(1u64, vec![b"second".to_vec()]).unwrap();
+
+        assert_eq!(btree.get(1u64).unwrap(), vec![b"second".to_vec()]);
+    }
+
+    #[test]
+    fn empty_tree_get_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = get_btree_in(dir.path());
+
+        assert!(btree.get(1u64).is_err());
+    }
+
+    #[test]
+    fn large_data_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let big_data = vec![0xABu8; 4000];
+        btree.insert(1u64, vec![big_data.clone()]).unwrap();
+
+        let result = btree.get(1u64).unwrap();
+        assert_eq!(result, vec![big_data]);
+    }
+
+    #[test]
+    fn interleaved_insert_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        for i in 1..=10u64 {
+            btree
+                .insert(i, vec![format!("v{}", i).into_bytes()])
+                .unwrap();
+            let result = btree.get(i).unwrap();
+            assert_eq!(result, vec![format!("v{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn boundary_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(0u64, vec![b"zero".to_vec()]).unwrap();
+        btree.insert(u64::MAX, vec![b"max".to_vec()]).unwrap();
+        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+
+        assert_eq!(btree.get(0u64).unwrap(), vec![b"zero".to_vec()]);
+        assert_eq!(btree.get(u64::MAX).unwrap(), vec![b"max".to_vec()]);
+        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
+    }
 }

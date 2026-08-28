@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::FileExt,
 };
 
-use crate::storage::engine::read_intensive::bplus_tree::header::PageHeader;
+use crate::storage::engine::read_intensive::bplus_tree::{PageKind, header::IndexHeader};
 
 use super::{
     PAGE_SIZE,
@@ -20,17 +20,33 @@ pub(super) struct Index {
 }
 
 impl Index {
-    pub fn allocate(&mut self) -> u64 {
+    pub fn allocate(&mut self, page_ty: PageKind) -> u64 {
         let id = self.next_id;
         // TODO: introduce a better way to find next
         // available id then just incrementing
+        let end_offset = Self::page_offset(id) + PAGE_SIZE as u64;
+        self.index_file
+            .set_len(end_offset)
+            .expect("Failed to set length of heap file");
         self.next_id += 1;
-        self.index_frames.get_mut().insert(
+
+        let header = IndexHeader {
             id,
-            Page {
-                data: [0u8; PAGE_SIZE],
-            },
-        );
+            free_start: super::HEADER_SIZE as u16,
+            free_end: PAGE_SIZE as u16,
+            flags: 0,
+            ptr: 0,
+            page_ty,
+        };
+
+        let mut buf = [0u8; PAGE_SIZE];
+        header.serialize(&mut buf);
+
+        self.index_file
+            .write_all_at(&buf, Self::page_offset(id))
+            .expect("Failed to write header to heap file");
+
+        self.index_frames.get_mut().insert(id, Page { data: buf });
 
         id
     }

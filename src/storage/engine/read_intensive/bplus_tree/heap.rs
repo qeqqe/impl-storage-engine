@@ -9,12 +9,14 @@
 
 use std::{error::Error, os::unix::fs::FileExt};
 
+use crate::storage::engine::read_intensive::bplus_tree::header::HEAP_HEADER_SIZE;
+
 use super::slotted_page::HeapPage;
 
 use super::{header::HeapHeader, slotted_page::CellPointer};
 
 pub(super) const PAGE_SIZE: usize = 8192;
-pub(super) const HEADER_SIZE: usize = 13;
+pub(super) const HEADER_SIZE: usize = 21;
 pub(super) const SLOT_SIZE: usize = 4;
 
 pub(super) struct Heap {
@@ -35,7 +37,7 @@ impl Heap {
         let header = HeapHeader::deserialize(&buf).ok_or("Couldn't deserialize the header")?;
 
         let cell_ptrs = self.get_cell_ptr(&buf, &header);
-        for cell_ptr in cell_ptrs {
+        for cell_ptr in &cell_ptrs {
             let off = cell_ptr.cell_offset as usize;
             let size = cell_ptr.cell_size as usize;
             let mut data = vec![0u8; size];
@@ -93,15 +95,36 @@ impl Heap {
 
     pub fn fetch(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
         let mut buf = [0u8; PAGE_SIZE];
-        self.heap_file
-            .read_exact_at(&mut buf, Self::page_offset(id))?;
+        let offset = Self::page_offset(id);
+        let metadata = self.heap_file.metadata()?;
+
+        self.heap_file.read_exact_at(&mut buf, offset)?;
         Ok(HeapPage { data: buf })
     }
 
     pub fn allocate(&mut self) -> u64 {
         let id = self.next_id;
+
+        let end_offset = Self::page_offset(id) + PAGE_SIZE as u64;
+        self.heap_file
+            .set_len(end_offset)
+            .expect("Failed to set length of heap file");
+
+        let header = HeapHeader {
+            id,
+            ptr: 0,
+            free_start: HEAP_HEADER_SIZE as u16,
+            free_end: PAGE_SIZE as u16,
+            flags: 0,
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        header.serialize(&mut buf);
+
+        self.heap_file
+            .write_all_at(&buf, Self::page_offset(id))
+            .expect("Failed to write header to heap file");
+
         self.next_id += 1;
-        // TODO: Add caching??
         id
     }
 
@@ -177,7 +200,7 @@ impl Heap {
 
     pub fn write_page(&self, id: u64, page: &HeapPage) -> Result<(), Box<dyn Error>> {
         self.heap_file
-            .write_all_at(&page.data, Self::page_offset(id));
+            .write_all_at(&page.data, Self::page_offset(id))?;
         Ok(())
     }
     /// Follows the ptr till the page contains a overflow page
