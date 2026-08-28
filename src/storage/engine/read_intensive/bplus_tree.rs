@@ -1212,25 +1212,184 @@ mod test {
             btree
                 .insert(i, vec![format!("data-{}", i).into_bytes()])
                 .unwrap();
+        }
 
-            for j in 1..=i {
-                let result = btree.get(j);
-                assert!(
-                    result.is_ok(),
-                    "Failed to get key {} after inserting key {} (count={})",
-                    j,
-                    i,
-                    i
-                );
+        for i in 1..=count {
+            let result = btree.get(i).unwrap();
+            assert_eq!(
+                result,
+                vec![format!("data-{}", i).into_bytes()],
+                "Failed to get key {}",
+                i
+            );
+        }
+
+        assert!(btree.get(0).is_err());
+        assert!(btree.get(count + 1).is_err());
+    }
+
+    #[test]
+    fn internal_node_exact_separator_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = ORDER as u64 * 3;
+        for i in (1..=count).step_by(2) {
+            btree
+                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in (1..=count).step_by(2) {
+            let result = btree.get(i);
+            assert!(result.is_ok(), "Key {} should exist", i);
+            assert_eq!(result.unwrap(), vec![format!("val-{}", i).into_bytes()]);
+        }
+
+        for i in (2..=count).step_by(2) {
+            let result = btree.get(i);
+            assert!(result.is_err(), "Key {} should not exist", i);
+        }
+    }
+
+    #[test]
+    fn internal_node_deletion_and_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = ORDER as u64 * 3;
+        for i in 1..=count {
+            btree
+                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        // delete odd keys to trigger leaf/internal redistributions and merges
+        for i in (1..=count).step_by(2) {
+            btree.delete(i).unwrap();
+        }
+
+        // check odd keys are gone and even keys remain
+        for i in 1..=count {
+            if i % 2 == 1 {
+                assert!(btree.get(i).is_err(), "Key {} should be deleted", i);
+            } else {
+                let result = btree.get(i);
+                assert!(result.is_ok(), "Key {} should still exist", i);
+                assert_eq!(result.unwrap(), vec![format!("data-{}", i).into_bytes()]);
+            }
+        }
+
+        // reinsert deleted keys and check
+        for i in (1..=count).step_by(2) {
+            btree
+                .insert(i, vec![format!("re-data-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 1..=count {
+            let result = btree.get(i).unwrap();
+            if i % 2 == 1 {
+                assert_eq!(result, vec![format!("re-data-{}", i).into_bytes()]);
+            } else {
+                assert_eq!(result, vec![format!("data-{}", i).into_bytes()]);
+            }
+        }
+    }
+
+    #[test]
+    fn internal_node_root_collapse_on_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = ORDER as u64 * 2;
+        for i in 1..=count {
+            btree
+                .insert(i, vec![format!("v-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        // delete almost all keys except a few, triggering multiple merges and root collapse
+        for i in 4..=count {
+            btree.delete(i).unwrap();
+        }
+
+        assert_eq!(btree.get(1).unwrap(), vec![b"v-1".to_vec()]);
+        assert_eq!(btree.get(2).unwrap(), vec![b"v-2".to_vec()]);
+        assert_eq!(btree.get(3).unwrap(), vec![b"v-3".to_vec()]);
+        assert!(btree.get(4).is_err());
+
+        // insert new keys into the collapsed root
+        btree.insert(100, vec![b"v-100".to_vec()]).unwrap();
+        assert_eq!(btree.get(100).unwrap(), vec![b"v-100".to_vec()]);
+    }
+
+    #[test]
+    fn multi_level_mixed_workload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = 300u64;
+        for i in 1..=count {
+            btree
+                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 100..=200 {
+            btree.delete(i).unwrap();
+        }
+
+        for i in 1..=count {
+            if (100..=200).contains(&i) {
+                assert!(btree.get(i).is_err(), "Key {} should be deleted", i);
+            } else {
                 assert_eq!(
-                    result.unwrap(),
-                    vec![format!("data-{}", j).into_bytes()],
-                    "Wrong data for key {} after inserting key {}",
-                    j,
-                    i
+                    btree.get(i).unwrap(),
+                    vec![format!("val-{}", i).into_bytes()]
                 );
             }
         }
+
+        for i in 500..=600 {
+            btree
+                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 500..=600 {
+            assert_eq!(
+                btree.get(i).unwrap(),
+                vec![format!("val-{}", i).into_bytes()]
+            );
+        }
+    }
+
+    #[test]
+    fn delete_all_from_multi_level_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let count = ORDER as u64 * 2;
+        for i in 1..=count {
+            btree
+                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        for i in 1..=count {
+            btree.delete(i).unwrap();
+            assert!(btree.get(i).is_err());
+        }
+
+        // tree is empty... getting any key should return error
+        for i in 1..=count {
+            assert!(btree.get(i).is_err());
+        }
+
+        // can insert again into empty root
+        btree.insert(42, vec![b"forty-two".to_vec()]).unwrap();
+        assert_eq!(btree.get(42).unwrap(), vec![b"forty-two".to_vec()]);
     }
 
     #[test]

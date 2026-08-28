@@ -221,14 +221,21 @@ impl Page {
     pub fn set_header_ptr(&mut self, ptr: u64) -> Result<(), Box<dyn Error>> {
         let mut header = self.header()?;
         header.ptr = ptr;
-        header.serialize(&mut self.data);
+        header.serialize(&mut self.data[..HEADER_SIZE]);
         Ok(())
     }
 
     pub fn set_page_kind(&mut self, page_ty: PageKind) -> Result<(), Box<dyn Error>> {
         let mut header = self.header()?;
+        let was_leaf = header.page_ty == PageKind::Leaf
+            || (header.page_ty == PageKind::Root && header.is_root_leaf());
         header.page_ty = page_ty;
-        header.serialize(&mut self.data);
+        if page_ty == PageKind::Root && was_leaf {
+            header.set_root_leaf();
+        } else if page_ty != PageKind::Root {
+            header.clear_root_leaf();
+        }
+        header.serialize(&mut self.data[..HEADER_SIZE]);
         Ok(())
     }
 
