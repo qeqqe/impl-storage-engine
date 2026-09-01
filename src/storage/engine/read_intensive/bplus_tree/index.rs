@@ -1,25 +1,28 @@
-use std::{
-    cell::{RefCell, RefMut},
-    collections::HashMap,
-    error::Error,
-    os::unix::fs::FileExt,
-};
+use std::{error::Error, fs::File, os::unix::fs::FileExt, path::PathBuf};
 
 use crate::storage::engine::read_intensive::bplus_tree::{PageKind, header::IndexHeader};
 
-use super::{
-    PAGE_SIZE,
-    slotted_page::{Cell, Page},
-};
+use super::{PAGE_SIZE, buffer_pool::BufferPool, slotted_page::Page};
+
+const INDEX_POOL_CAPACITY: usize = 10_000;
 
 pub(super) struct Index {
-    pub index_file: std::fs::File,
-    pub index_path: std::path::PathBuf,
-    pub index_frames: RefCell<HashMap<u64, Page>>, // TODO: add eviction policy
+    pub index_file: File,
+    pub index_path: PathBuf,
+    pub pool: BufferPool<Page>,
     pub next_id: u64,
 }
 
 impl Index {
+    pub fn new(index_file: File, index_path: PathBuf) -> Self {
+        Index {
+            index_file,
+            index_path,
+            pool: BufferPool::new(INDEX_POOL_CAPACITY),
+            next_id: 0,
+        }
+    }
+
     pub fn allocate(&mut self, page_ty: PageKind) -> u64 {
         let id = self.next_id;
         // TODO: introduce a better way to find next
@@ -42,40 +45,69 @@ impl Index {
         let mut buf = [0u8; PAGE_SIZE];
         header.serialize(&mut buf);
 
-        self.index_file
-            .write_all_at(&buf, Self::page_offset(id))
-            .expect("Failed to write header to heap file");
-
-        self.index_frames.get_mut().insert(id, Page { data: buf });
+        self.pool
+            .insert(id, Page { data: buf })
+            .expect("buf pool capacity exceeded during allocate... no-STEAL backpressure...)");
+        self.pool.mark_dirty(id);
 
         id
     }
 
-    pub fn fetch(&self, id: u64) -> RefMut<'_, Page> {
-        if !self.index_frames.borrow().contains_key(&id) {
+    pub fn fetch(&mut self, id: u64) -> &Page {
+        if !self.pool.contains(id) {
             let mut buf = [0u8; PAGE_SIZE];
             self.index_file
                 .read_exact_at(&mut buf, Self::page_offset(id))
                 .unwrap();
+            self.pool.insert(id, Page { data: buf }).expect(
+                "buf pool capacity exceeded during index fetch... no-STEAL backpressure...",
+            );
         }
-        RefMut::map(self.index_frames.borrow_mut(), |f| f.get_mut(&id).unwrap())
+        self.pool.get(id).unwrap()
+    }
+
+    pub fn fetch_mut(&mut self, id: u64) -> &mut Page {
+        if !self.pool.contains(id) {
+            let mut buf = [0u8; PAGE_SIZE];
+            self.index_file
+                .read_exact_at(&mut buf, Self::page_offset(id))
+                .unwrap();
+            self.pool.insert(id, Page { data: buf }).expect(
+                "buf pool capacity exceeded during index fetch_mut... NO-STEAL backpressure...",
+            );
+        }
+        self.pool.mark_dirty(id);
+        self.pool.get_mut(id).unwrap()
     }
 
     pub fn flush(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
-        let frames = self.index_frames.borrow();
-        let page = frames.get(&id).ok_or("Page not in frames")?;
-        self.index_file
-            .write_all_at(&page.data, Self::page_offset(id));
+        if self.pool.is_dirty(id)
+            && let Some(page) = self.pool.get(id)
+        {
+            let data = page.data;
+            self.index_file.write_all_at(&data, Self::page_offset(id))?;
+            self.pool.clear_dirty_single(id);
+        }
         Ok(())
     }
 
     pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
-        let frames = self.index_frames.borrow();
-        for (&id, page) in frames.iter() {
-            self.index_file
-                .write_all_at(&page.data, Self::page_offset(id));
+        let dirty_ids = self.pool.dirty_page_ids();
+        for id in dirty_ids {
+            if let Some(page) = self.pool.get(id) {
+                let data = page.data;
+                self.index_file.write_all_at(&data, Self::page_offset(id))?;
+            }
         }
+        self.pool.clear_dirty();
         Ok(())
+    }
+
+    pub fn discard_dirty(&mut self) {
+        let dirty_ids = self.pool.dirty_page_ids();
+        for id in dirty_ids {
+            self.pool.remove(id);
+        }
     }
 
     fn page_offset(id: u64) -> u64 {

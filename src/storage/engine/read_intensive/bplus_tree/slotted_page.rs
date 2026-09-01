@@ -77,8 +77,7 @@ impl Page {
         // Btree, log N is the binary search TC for searching insertion point,
         // and in worst case you would need to shift around N-1 (only for Leaf
         // nodes though as we know the first element will almost certainly never
-        // be shifted as the key wouldn't even lie in the this node), else N on
-        // internal/root node.
+        // be shifted as the key wouldn't even lie in the this node).
 
         let cell_ptr = CellPointer {
             cell_offset: start as u16,
@@ -93,8 +92,7 @@ impl Page {
             let mid = lo + (hi - lo) / 2;
             let mid_slot = self.slot(mid);
             let mid_key = u64::from_le_bytes(
-                self.data[mid_slot.cell_offset as usize
-                    ..mid_slot.cell_offset as usize + KEY_SIZE]
+                self.data[mid_slot.cell_offset as usize..mid_slot.cell_offset as usize + KEY_SIZE]
                     .try_into()
                     .unwrap(),
             );
@@ -125,7 +123,7 @@ impl Page {
         Ok(n_slots as usize + 1)
     }
 
-    // pub fn handle_overflow_cell(&mut self) {} // cell will NEVER overflow
+    // pub fn handle_overflow_cell(&mut self) {} // index page cell will NEVER overflow
 
     pub fn header(&self) -> Result<IndexHeader, Box<dyn Error>> {
         IndexHeader::deserialize(&self.data[..HEADER_SIZE])
@@ -174,8 +172,7 @@ impl Page {
             hdr.serialize(&mut self.data[..HEADER_SIZE]);
         }
 
-        let use_heap_ptr = page_ty == PageKind::Leaf
-            || (page_ty == PageKind::Root && is_root_leaf);
+        let use_heap_ptr = page_ty == PageKind::Leaf || (page_ty == PageKind::Root && is_root_leaf);
 
         for cell in cells {
             let value = if use_heap_ptr {
@@ -303,7 +300,6 @@ impl HeapPage {
 
         let end = data_end_offset as usize;
 
-        // TODO: implement overflow pages.
         let start = end
             .checked_sub(d_len)
             .filter(|&s| s >= (cell_ptr_offset as usize + super::heap::SLOT_SIZE))

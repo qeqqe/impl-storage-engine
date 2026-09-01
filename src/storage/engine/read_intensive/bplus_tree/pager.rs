@@ -1,6 +1,6 @@
-use std::{collections::HashMap, error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf};
 
-use super::{heap::Heap, index::Index, slotted_page::Cell};
+use super::{buffer_pool::BufferPool, heap::Heap, index::Index, slotted_page::Cell};
 
 pub(super) struct Pager {
     pub index: Index,
@@ -23,23 +23,14 @@ impl Pager {
             .truncate(false)
             .open(&index_path)?;
 
-        let heap = Heap {
-            heap_file,
-            path: heap_path,
-            next_id: 0,
-        };
-        let index = Index {
-            index_file,
-            index_path,
-            index_frames: HashMap::new().into(),
-            next_id: 0,
-        };
+        let heap = Heap::new(heap_file, heap_path);
+        let index = Index::new(index_file, index_path);
 
         Ok(Pager { index, heap })
     }
 
     pub fn fetch_heap_data(
-        &self,
+        &mut self,
         cell: &Cell,
         data_record: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -49,5 +40,16 @@ impl Pager {
         } else {
             Err("Couldn't find the header pointer".into())
         }
+    }
+
+    pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
+        self.index.flush_all()?;
+        self.heap.flush_all()?;
+        Ok(())
+    }
+
+    pub fn discard_all_dirty(&mut self) {
+        self.index.discard_dirty();
+        self.heap.discard_dirty();
     }
 }

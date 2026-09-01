@@ -7,10 +7,12 @@
 
 // TODO: implement overflow pages cus they are bound to exist
 
+use std::fs::File;
 use std::{error::Error, os::unix::fs::FileExt};
 
 use crate::storage::engine::read_intensive::bplus_tree::header::HEAP_HEADER_SIZE;
 
+use super::buffer_pool::BufferPool;
 use super::slotted_page::HeapPage;
 
 use super::{header::HeapHeader, slotted_page::CellPointer};
@@ -19,54 +21,67 @@ pub(super) const PAGE_SIZE: usize = 8192;
 pub(super) const HEADER_SIZE: usize = 21;
 pub(super) const SLOT_SIZE: usize = 4;
 
+const HEAP_POOL_CAPACITY: usize = 10_000;
+
 pub(super) struct Heap {
-    pub heap_file: std::fs::File,
+    pub heap_file: File,
     pub path: std::path::PathBuf,
     pub next_id: u64,
+    pub pool: BufferPool<HeapPage>,
 }
 
 impl Heap {
+    pub fn new(heap_file: File, path: std::path::PathBuf) -> Self {
+        Heap {
+            heap_file,
+            path,
+            next_id: 0,
+            pool: BufferPool::new(HEAP_POOL_CAPACITY),
+        }
+    }
     pub fn get_record(
-        &self,
+        &mut self,
         id: u64,
         data_records: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut buf = [0u8; PAGE_SIZE];
-        self.heap_file
-            .read_exact_at(&mut buf, Self::page_offset(id))?;
-        let header = HeapHeader::deserialize(&buf).ok_or("Couldn't deserialize the header")?;
+        let page = self.fetch(id)?;
+        let header =
+            HeapHeader::deserialize(&page.data).ok_or("Couldn't deserialize the header")?;
 
-        let cell_ptrs = self.get_cell_ptr(&buf, &header);
+        let cell_ptrs = Self::get_cell_ptr(&page.data, &header);
         for cell_ptr in &cell_ptrs {
             let off = cell_ptr.cell_offset as usize;
             let size = cell_ptr.cell_size as usize;
             let mut data = vec![0u8; size];
-            data.copy_from_slice(&buf[off..off + size]);
+            data.copy_from_slice(&page.data[off..off + size]);
             data_records.push(data);
         }
 
-        if header.has_overflow_page() {
-            self.collect_overflow_records(header.ptr, data_records)?;
+        let has_overflow = header.has_overflow_page();
+        let overflow_ptr = header.ptr;
+
+        if has_overflow {
+            self.collect_overflow_records(overflow_ptr, data_records)?;
         }
 
         Ok(())
     }
 
     pub fn collect_overflow_records(
-        &self,
+        &mut self,
         overflow_id: u64,
         data_records: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
         let mut cur_id = overflow_id;
         loop {
-            let hp = self.fetch(cur_id)?;
-            let header = hp.header()?;
-            let cell_ptrs = self.get_cell_ptr(&hp.data, &header);
+            let page = self.fetch(cur_id)?;
+            let header = page.header()?;
+            let cell_ptrs = Self::get_cell_ptr(&page.data, &header);
             for cell_ptr in cell_ptrs {
                 let start = cell_ptr.cell_offset as usize;
                 let end = start + cell_ptr.cell_size as usize;
-                let mut data_record = vec![];
-                data_record.copy_from_slice(&hp.data[start..end]);
+                let mut data_record = vec![0u8; end - start];
+                data_record.copy_from_slice(&page.data[start..end]);
                 data_records.push(data_record);
             }
 
@@ -80,26 +95,38 @@ impl Heap {
         Ok(())
     }
 
-    fn get_cell_ptr(&self, buf: &[u8], header: &HeapHeader) -> Vec<CellPointer> {
+    fn get_cell_ptr(buf: &[u8], header: &HeapHeader) -> Vec<CellPointer> {
         let range = (header.free_start - HEADER_SIZE as u16) / 4; // cell offset + cell size = 4 bytes
         // NOTE: here we can derive that a single cellpointer is a
         // data member's pointer of a row.
         let mut cell_ptr: Vec<CellPointer> = Vec::with_capacity(range as usize);
 
         for i in 0..range {
-            cell_ptr.push(self.slot(i, buf));
+            cell_ptr.push(Self::slot(i, buf));
         }
 
         cell_ptr
     }
 
-    pub fn fetch(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
-        let mut buf = [0u8; PAGE_SIZE];
-        let offset = Self::page_offset(id);
-        let metadata = self.heap_file.metadata()?;
+    pub fn fetch(&mut self, id: u64) -> Result<&HeapPage, Box<dyn Error>> {
+        if !self.pool.contains(id) {
+            let page = self.read_page_from_disk(id)?;
+            self.pool.insert(id, page)?;
+        }
+        self.pool
+            .get(id)
+            .ok_or("Page not in pool after fetch".into())
+    }
 
-        self.heap_file.read_exact_at(&mut buf, offset)?;
-        Ok(HeapPage { data: buf })
+    pub fn fetch_mut(&mut self, id: u64) -> Result<&mut HeapPage, Box<dyn Error>> {
+        if !self.pool.contains(id) {
+            let page = self.read_page_from_disk(id)?;
+            self.pool.insert(id, page)?;
+        }
+        self.pool.mark_dirty(id);
+        self.pool
+            .get_mut(id)
+            .ok_or("Page not in pool after fetch_mut".into())
     }
 
     pub fn allocate(&mut self) -> u64 {
@@ -117,35 +144,36 @@ impl Heap {
             free_end: PAGE_SIZE as u16,
             flags: 0,
         };
-        let mut buf = [0u8; HEADER_SIZE];
-        header.serialize(&mut buf);
+        let mut page = HeapPage {
+            data: [0u8; PAGE_SIZE],
+        };
+        header.serialize(&mut page.data[..HEADER_SIZE]);
 
-        self.heap_file
-            .write_all_at(&buf, Self::page_offset(id))
-            .expect("Failed to write header to heap file");
+        self.pool
+            .insert(id, page)
+            .expect("Buffer pool capacity exceeded during allocate (NO-STEAL backpressure)");
+        self.pool.mark_dirty(id);
 
         self.next_id += 1;
         id
     }
 
-    pub fn allocate_primary(&mut self) -> (u64, HeapPage) {
+    pub fn allocate_primary(&mut self) -> u64 {
         let id = self.allocate();
+        let page = self.pool.get_mut(id).unwrap();
         let header = HeapHeader::new_primary(id);
-        let mut page = HeapPage {
-            data: [0u8; PAGE_SIZE],
-        };
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        (id, page)
+        self.pool.mark_dirty(id);
+        id
     }
 
-    pub fn allocate_overflow(&mut self) -> (u64, HeapPage) {
+    pub fn allocate_overflow(&mut self) -> u64 {
         let id = self.allocate();
+        let page = self.pool.get_mut(id).unwrap();
         let header = HeapHeader::new_overflow(id);
-        let mut page = HeapPage {
-            data: [0u8; PAGE_SIZE],
-        };
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        (id, page)
+        self.pool.mark_dirty(id);
+        id
     }
 
     /// Inserts the data records in the specified heap page.
@@ -157,102 +185,123 @@ impl Heap {
         // First tails till the end of overflow pages (if they exist)
         // check if theres enough space, if yes insert the record
         // else insert a new page and insert.
-        let mut page = self.fetch(primary_page_id)?;
-        let header = page.header()?;
+        let header = {
+            let page = self.fetch(primary_page_id)?;
+            page.header()?
+        };
 
-        let mut current_page = page;
-        let mut current_header = header;
         let mut current_id = primary_page_id;
 
-        if current_header.is_overflow_page() {
-            let (of_id, of_page, of_hdr) = self.find_tail(current_header.ptr)?;
-            current_id = of_id;
-            current_page = of_page;
-            current_header = of_hdr;
+        if header.is_overflow_page() {
+            current_id = self.find_tail_id(header.ptr)?;
         }
 
         for record in data_record {
             let d_len = record.len();
             let needed = d_len + SLOT_SIZE;
 
-            if current_header.remaining_space() >= needed {
-                current_page.add_cell(record)?;
-                current_header = current_page.header()?;
+            let remaining = {
+                let page = self.fetch(current_id)?;
+                page.header()?.remaining_space()
+            };
+
+            if remaining >= needed {
+                let page = self.fetch_mut(current_id)?;
+                page.add_cell(record)?;
             } else {
-                // overflow occured create a new overflow page
-                let (overflow_id, mut overflow_page) = self.allocate_overflow();
+                let overflow_id = self.allocate_overflow();
 
-                current_header.set_has_overflow(overflow_id);
-                current_header.serialize(&mut current_page.data[..HEADER_SIZE]);
-                self.write_page(current_id, &current_page)?;
+                {
+                    let current_page = self.fetch_mut(current_id)?;
+                    let mut hdr = current_page.header()?;
+                    hdr.set_has_overflow(overflow_id);
+                    hdr.serialize(&mut current_page.data[..HEADER_SIZE]);
+                }
 
-                overflow_page.add_cell(record)?;
+                {
+                    let overflow_page = self.fetch_mut(overflow_id)?;
+                    overflow_page.add_cell(record)?;
+                }
 
                 current_id = overflow_id;
-                current_page = overflow_page;
-                current_header = current_page.header()?;
             }
         }
 
-        self.write_page(current_id, &current_page)?;
         Ok(())
     }
 
-    pub fn write_page(&self, id: u64, page: &HeapPage) -> Result<(), Box<dyn Error>> {
+    fn read_page_from_disk(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
+        let mut buf = [0u8; PAGE_SIZE];
         self.heap_file
-            .write_all_at(&page.data, Self::page_offset(id))?;
+            .read_exact_at(&mut buf, Self::page_offset(id))?;
+        Ok(HeapPage { data: buf })
+    }
+
+    pub fn flush(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
+        if self.pool.is_dirty(id)
+            && let Some(page) = self.pool.get(id)
+        {
+            let data = page.data;
+            self.heap_file.write_all_at(&data, Self::page_offset(id))?;
+            self.pool.clear_dirty_single(id);
+        }
         Ok(())
     }
-    /// Follows the ptr till the page contains a overflow page
-    fn find_tail(&self, id: u64) -> Result<(u64, HeapPage, HeapHeader), Box<dyn Error>> {
-        let mut cur_id = id;
-        let mut cur_page = self.fetch(id)?;
-        let mut cur_hdr = cur_page.header()?;
 
-        while cur_hdr.has_overflow_page() {
-            cur_id = cur_hdr.ptr;
-            cur_page = self.fetch(cur_id)?;
-            cur_hdr = cur_page.header()?;
+    pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
+        let dirty_ids = self.pool.dirty_page_ids();
+        for id in dirty_ids {
+            if let Some(page) = self.pool.get(id) {
+                let data = page.data;
+                self.heap_file.write_all_at(&data, Self::page_offset(id))?;
+            }
         }
-        Ok((cur_id, cur_page, cur_hdr))
+        self.pool.clear_dirty();
+        Ok(())
     }
 
-    /// Returns the chain of ptr from primary to the last overflow page
-    pub fn free_chain(&self, primary_id: u64) -> Result<Vec<u64>, Box<dyn Error>> {
-        let mut chain = vec![primary_id];
-        let page = self.fetch(primary_id)?;
-        let mut hdr = page.header()?;
-
-        while hdr.has_overflow_page() {
-            let next_id = hdr.ptr;
-            chain.push(next_id);
-            let page = self.fetch(next_id)?;
-            hdr = page.header()?;
+    pub fn discard_dirty(&mut self) {
+        let dirty_ids = self.pool.dirty_page_ids();
+        for id in dirty_ids {
+            self.pool.remove(id);
         }
+    }
 
+    fn find_tail_id(&mut self, id: u64) -> Result<u64, Box<dyn Error>> {
+        let mut cur_id = id;
+        loop {
+            let hdr = {
+                let page = self.fetch(cur_id)?;
+                page.header()?
+            };
+            if hdr.has_overflow_page() {
+                cur_id = hdr.ptr;
+            } else {
+                return Ok(cur_id);
+            }
+        }
+    }
+
+    /// returns the chain of ptr from primary to the last overflow page
+    pub fn free_chain(&mut self, primary_id: u64) -> Result<Vec<u64>, Box<dyn Error>> {
+        let mut chain = vec![primary_id];
+        let mut cur_id = primary_id;
+        loop {
+            let hdr = {
+                let page = self.fetch(cur_id)?;
+                page.header()?
+            };
+            if hdr.has_overflow_page() {
+                cur_id = hdr.ptr;
+                chain.push(cur_id);
+            } else {
+                break;
+            }
+        }
         Ok(chain)
     }
 
-    pub fn add_cell(
-        &mut self,
-        page_id: u64,
-        key: u64,
-        h_ptr: u64,
-    ) -> Result<usize, Box<dyn Error>> {
-        // IF the page is about to overflow we have to allocate a new page,
-        // mark the current page to indicate a it has an overflow child, update the `ptr`
-        // to point to the page id of the new allocated page, and finally update the allocated page
-        // to the new overflow'd page).
-        let page = self.fetch(page_id)?;
-
-        let p_hdr = page.header()?;
-
-        while p_hdr.has_overflow_page() {}
-
-        todo!()
-    }
-
-    fn slot(&self, i: u16, buf: &[u8]) -> CellPointer {
+    fn slot(i: u16, buf: &[u8]) -> CellPointer {
         let off = HEADER_SIZE + i as usize * SLOT_SIZE;
 
         CellPointer {
