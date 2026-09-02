@@ -111,7 +111,12 @@ impl Heap {
     pub fn fetch(&mut self, id: u64) -> Result<&HeapPage, Box<dyn Error>> {
         if !self.pool.contains(id) {
             let page = self.read_page_from_disk(id)?;
-            self.pool.insert(id, page)?;
+            if let Some(evicted) = self.pool.insert(id, page)? {
+                if evicted.was_dirty {
+                    self.heap_file
+                        .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
+                }
+            }
         }
         self.pool
             .get(id)
@@ -121,7 +126,12 @@ impl Heap {
     pub fn fetch_mut(&mut self, id: u64) -> Result<&mut HeapPage, Box<dyn Error>> {
         if !self.pool.contains(id) {
             let page = self.read_page_from_disk(id)?;
-            self.pool.insert(id, page)?;
+            if let Some(evicted) = self.pool.insert(id, page)? {
+                if evicted.was_dirty {
+                    self.heap_file
+                        .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
+                }
+            }
         }
         self.pool.mark_dirty(id);
         self.pool
@@ -149,9 +159,16 @@ impl Heap {
         };
         header.serialize(&mut page.data[..HEADER_SIZE]);
 
-        self.pool
+        if let Some(evicted) = self.pool
             .insert(id, page)
-            .expect("Buffer pool capacity exceeded during allocate (NO-STEAL backpressure)");
+            .expect("Buffer pool capacity exceeded during allocate (all pages pinned)")
+        {
+            if evicted.was_dirty {
+                self.heap_file
+                    .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
+                    .expect("Failed to write-back stolen page during allocate");
+            }
+        }
         self.pool.mark_dirty(id);
 
         self.next_id += 1;

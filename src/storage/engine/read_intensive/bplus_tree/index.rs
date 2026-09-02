@@ -45,9 +45,16 @@ impl Index {
         let mut buf = [0u8; PAGE_SIZE];
         header.serialize(&mut buf);
 
-        self.pool
+        if let Some(evicted) = self.pool
             .insert(id, Page { data: buf })
-            .expect("buf pool capacity exceeded during allocate... no-STEAL backpressure...)");
+            .expect("buf pool capacity exceeded during allocate... all pages pinned...)")
+        {
+            if evicted.was_dirty {
+                self.index_file
+                    .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
+                    .expect("Failed to write-back stolen page during allocate");
+            }
+        }
         self.pool.mark_dirty(id);
 
         id
@@ -59,9 +66,15 @@ impl Index {
             self.index_file
                 .read_exact_at(&mut buf, Self::page_offset(id))
                 .unwrap();
-            self.pool.insert(id, Page { data: buf }).expect(
-                "buf pool capacity exceeded during index fetch... no-STEAL backpressure...",
-            );
+            if let Some(evicted) = self.pool.insert(id, Page { data: buf }).expect(
+                "buf pool capacity exceeded during index fetch... all pages pinned...",
+            ) {
+                if evicted.was_dirty {
+                    self.index_file
+                        .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
+                        .expect("Failed to write-back stolen page during fetch");
+                }
+            }
         }
         self.pool.get(id).unwrap()
     }
@@ -72,9 +85,15 @@ impl Index {
             self.index_file
                 .read_exact_at(&mut buf, Self::page_offset(id))
                 .unwrap();
-            self.pool.insert(id, Page { data: buf }).expect(
-                "buf pool capacity exceeded during index fetch_mut... NO-STEAL backpressure...",
-            );
+            if let Some(evicted) = self.pool.insert(id, Page { data: buf }).expect(
+                "buf pool capacity exceeded during index fetch_mut... all pages pinned...",
+            ) {
+                if evicted.was_dirty {
+                    self.index_file
+                        .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
+                        .expect("Failed to write-back stolen page during fetch_mut");
+                }
+            }
         }
         self.pool.mark_dirty(id);
         self.pool.get_mut(id).unwrap()

@@ -1,8 +1,3 @@
-// Im still not sure if i should go NO-STEAL as
-// it'll defo use more memory then STEAL NO-FORCE
-// as we are not allowed to flush the dirty pages until
-// the transaction commited... idkk....
-
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 
@@ -16,6 +11,12 @@ pub(super) struct BufferPool<P> {
 struct FrameEntry<P> {
     page: P,
     pin_count: u32,
+}
+
+pub(super) struct EvictedPage<P> {
+    pub id: u64,
+    pub page: P,
+    pub was_dirty: bool,
 }
 
 impl<P> BufferPool<P> {
@@ -41,19 +42,21 @@ impl<P> BufferPool<P> {
         self.frames.get_mut(&id).map(|e| &mut e.page)
     }
 
-    pub fn insert(&mut self, id: u64, page: P) -> Result<(), Box<dyn Error>> {
-        if !self.frames.contains_key(&id)
-            && self.frames.len() >= self.max_frames
-            && self.evict_one().is_none()
-        {
-            return Err("Buffer pool full: no clean unpinned pages available for eviction (NO-STEAL backpressure)".into());
-        }
+    pub fn insert(&mut self, id: u64, page: P) -> Result<Option<EvictedPage<P>>, Box<dyn Error>> {
+        let evicted = if !self.frames.contains_key(&id) && self.frames.len() >= self.max_frames {
+            match self.evict_one() {
+                Some(e) => Some(e),
+                None => return Err("Buffer pool full: all pages are pinned".into()),
+            }
+        } else {
+            None
+        };
 
         self.frames.insert(id, FrameEntry { page, pin_count: 0 });
         self.lru_order.retain(|&x| x != id);
         self.lru_order.push_back(id);
 
-        Ok(())
+        Ok(evicted)
     }
 
     pub fn mark_dirty(&mut self, id: u64) {
@@ -105,14 +108,16 @@ impl<P> BufferPool<P> {
         self.lru_order.retain(|&x| x != id);
         self.lru_order.push_back(id);
     }
-    /// Dirty pages are NEVER evicted. Only clean, unpinned pages are candidates for LRU eviction
-    fn evict_one(&mut self) -> Option<u64> {
+
+    /// STEAL policy... any unpinned page can be evicted. if its dirty the
+    /// caller is responsible for writing it back to disk before discarding.
+    fn evict_one(&mut self) -> Option<EvictedPage<P>> {
         let mut evict_idx = None;
         for (i, &id) in self.lru_order.iter().enumerate() {
             let Some(entry) = self.frames.get(&id) else {
                 continue;
             };
-            if entry.pin_count == 0 && !self.is_dirty(id) {
+            if entry.pin_count == 0 {
                 evict_idx = Some((i, id));
                 break;
             }
@@ -120,9 +125,14 @@ impl<P> BufferPool<P> {
 
         if let Some((idx, id)) = evict_idx {
             self.lru_order.remove(idx);
-            self.frames.remove(&id);
+            let was_dirty = self.is_dirty(id);
             self.dirty.remove(&id);
-            Some(id)
+            let entry = self.frames.remove(&id).unwrap();
+            Some(EvictedPage {
+                id,
+                page: entry.page,
+                was_dirty,
+            })
         } else {
             None
         }
@@ -150,7 +160,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn no_steal_refuses_to_evict_dirty_pages() {
+    fn steal_evicts_dirty_pages_and_returns_them() {
         let mut pool: BufferPool<Vec<u8>> = BufferPool::new(2);
 
         pool.insert(1, vec![1, 1, 1]).unwrap();
@@ -159,16 +169,15 @@ mod test {
         pool.insert(2, vec![2, 2, 2]).unwrap();
         pool.mark_dirty(2);
 
-        // pool is full of dirty pages.. inserting a 3rd must fail cus NO-STEAL
-        let err = pool.insert(3, vec![3, 3, 3]);
-        assert!(err.is_err());
-        assert!(pool.contains(1));
-        assert!(pool.contains(2));
-        assert!(!pool.contains(3));
-
-        // after cleaning page 1 the eviction should succeed
-        pool.clear_dirty_single(1);
-        assert!(pool.insert(3, vec![3, 3, 3]).is_ok());
+        // pool is full of dirty pages.. STEAL lets them be evicted
+        let result = pool.insert(3, vec![3, 3, 3]);
+        assert!(result.is_ok());
+        let evicted = result.unwrap();
+        assert!(evicted.is_some());
+        let evicted = evicted.unwrap();
+        assert_eq!(evicted.id, 1);
+        assert!(evicted.was_dirty);
+        assert_eq!(evicted.page, vec![1, 1, 1]);
 
         assert!(!pool.contains(1));
         assert!(pool.contains(2));
@@ -176,7 +185,7 @@ mod test {
     }
 
     #[test]
-    fn no_steal_refuses_to_evict_pinned_pages() {
+    fn steal_refuses_to_evict_pinned_pages() {
         let mut pool: BufferPool<Vec<u8>> = BufferPool::new(2);
 
         pool.insert(1, vec![1, 1, 1]).unwrap();
@@ -185,7 +194,7 @@ mod test {
         pool.insert(2, vec![2, 2, 2]).unwrap();
         pool.pin(2);
 
-        // here both the pages are clean, BUT pinned... so they can't evict
+        // here both the pages are pinned... so they can't evict even under STEAL
         let err = pool.insert(3, vec![3, 3, 3]);
         assert!(err.is_err());
 
@@ -195,5 +204,19 @@ mod test {
         assert!(!pool.contains(1));
         assert!(pool.contains(2));
         assert!(pool.contains(3));
+    }
+
+    #[test]
+    fn steal_evicts_clean_page_without_dirty_flag() {
+        let mut pool: BufferPool<Vec<u8>> = BufferPool::new(2);
+
+        pool.insert(1, vec![1, 1, 1]).unwrap();
+        pool.insert(2, vec![2, 2, 2]).unwrap();
+
+        let result = pool.insert(3, vec![3, 3, 3]).unwrap();
+        assert!(result.is_some());
+        let evicted = result.unwrap();
+        assert_eq!(evicted.id, 1);
+        assert!(!evicted.was_dirty);
     }
 }
