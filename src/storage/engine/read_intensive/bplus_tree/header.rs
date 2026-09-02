@@ -1,6 +1,7 @@
 use crate::storage::engine::read_intensive::bplus_tree::slotted_page::HeapPage;
 
 pub(crate) const HEAP_HEADER_SIZE: usize = 21;
+pub(crate) const WAL_HEADER_SIZE: usize = 21;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
@@ -166,5 +167,27 @@ impl HeapHeader {
 
     pub fn has_overflow_page(&self) -> bool {
         (self.flags >> 1) == 1
+    }
+}
+
+pub(super) struct WalHeader {
+    pub last_checkpoint_lsn: u64,
+    pub next_lsn: u64,
+    pub next_txn_id: u64,
+}
+
+impl WalHeader {
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        Some(Self {
+            last_checkpoint_lsn: u64::from_le_bytes(buf[0..8].try_into().ok()?),
+            next_lsn: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            next_txn_id: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+        })
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) {
+        buf[0..8].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.next_lsn.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.next_txn_id.to_le_bytes());
     }
 }

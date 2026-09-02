@@ -1,3 +1,7 @@
+//! The buffer pool is based on STEAL NO-FORCE policy,which means that mutated
+//! page buffers CAN be flushed to disk even before the transaction has
+//! commited, but only  if the condition `PageLSN <= FlushedLSN` is satisfied.
+
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 
