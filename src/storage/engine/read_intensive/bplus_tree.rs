@@ -106,7 +106,7 @@ impl BplusTree {
     // TODO: update the data records to contain more metadata about the
     // inserted item for a better labled addressing of the data memebers,
     // updates can mess up things if we're not careful withi it.
-    fn insert(&mut self, key: u64, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+    pub fn insert(&mut self, key: u64, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
         let mut breadcrumbs = self.breadcrumbs(key)?;
 
         if breadcrumbs.found {

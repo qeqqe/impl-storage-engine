@@ -19,20 +19,24 @@
 //!
 //! Now that Data_Page_LSN <= Last_Flushed_LSN_WAL, the buffer pool is finally
 //! allowed to write the dirty data page to disk.
+//!
+//! Basically the ARIES algorithm
 
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+use crate::storage::engine::read_intensive::bplus_tree::PageKind;
+
 use super::{buffer_pool::BufferPool, header::WAL_HEADER_SIZE, header::WalHeader};
 
-pub const WAL_RECORD_HEADER_SIZE: usize = 8 + 8 + 8 + 1 + 8 + 8 + 4 + 4; // 41 bytes
+pub const WAL_RECORD_HEADER_SIZE: usize = 8 + 4 + 8 + 1 + 1 + 8 + 4 + 2; // 36 bytes
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
-    Begin = 1,
+    Begin = 1, // the transaction begining
     Update = 2,
     Commit = 3,
     Abort = 4,
@@ -59,40 +63,49 @@ impl TryFrom<u8> for RecordType {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct WalRecordHeader {
     pub lsn: u64,
-    pub prev_lsn: u64,
+
+    // pub offset: u32, // we don't need offset, we can derive it
+    // pub prev_lsn: u64, // we don't need prev_lsn, we can derive it by self.lsn - 1
+    /// This will allow track back (end->start) in WAL,
+    /// we can derive the offset of the previous wal record by simply computing
+    /// `current_offset - current.prev_record_len`
+    pub prev_record_len: u32,
     pub txn_id: u64,
     pub record_type: RecordType,
     pub page_id: u64,
-    pub undo_next_lsn: u64,
-    pub payload_len: u32,
-    pub crc32: u32,
+    pub is_index: bool, // else heap
+    // [wal_record_header] \
+    // [undo_data_size:u16][undo_payload_bytes] \
+    // [redo_data_size:u16][redo_payload_bytes] \
+    // [next_wal_record_header]
+    pub payload_len: u32,         // +4 size for undo & redo size
+    pub payload_page_offset: u16, // offset of the modified data record in the data page
 }
 
 impl WalRecordHeader {
     pub fn serialize(&self, buf: &mut [u8]) {
         buf[0..8].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.prev_lsn.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.txn_id.to_le_bytes());
-        buf[24] = self.record_type as u8;
-        buf[25..33].copy_from_slice(&self.page_id.to_le_bytes());
-        buf[33..41].copy_from_slice(&self.undo_next_lsn.to_le_bytes());
-        buf[41..45].copy_from_slice(&self.payload_len.to_le_bytes());
-        buf[45..49].copy_from_slice(&self.crc32.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.prev_record_len.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.txn_id.to_le_bytes());
+        buf[20] = self.record_type as u8;
+        buf[21] = self.is_index as u8;
+        buf[22..30].copy_from_slice(&self.page_id.to_le_bytes());
+        buf[30..34].copy_from_slice(&self.payload_len.to_le_bytes());
+        buf[34..36].copy_from_slice(&self.payload_page_offset.to_le_bytes());
     }
 
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
         Some(Self {
             lsn: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            prev_lsn: u64::from_le_bytes(buf[8..16].try_into().ok()?),
-            txn_id: u64::from_le_bytes(buf[16..24].try_into().ok()?),
-            record_type: RecordType::try_from(buf[24]).ok()?,
-            page_id: u64::from_le_bytes(buf[25..33].try_into().ok()?),
-            undo_next_lsn: u64::from_le_bytes(buf[33..41].try_into().ok()?),
-            payload_len: u32::from_le_bytes(buf[41..45].try_into().ok()?),
-            crc32: u32::from_le_bytes(buf[45..49].try_into().ok()?),
+            prev_record_len: u32::from_le_bytes(buf[8..12].try_into().ok()?),
+            txn_id: u64::from_le_bytes(buf[12..20].try_into().ok()?),
+            record_type: RecordType::try_from(buf[20]).ok()?,
+            is_index: buf[21] == 1,
+            page_id: u64::from_le_bytes(buf[22..30].try_into().ok()?),
+            payload_len: u32::from_le_bytes(buf[30..34].try_into().ok()?),
+            payload_page_offset: u16::from_le_bytes(buf[34..36].try_into().ok()?),
         })
     }
 }
@@ -129,21 +142,68 @@ impl Wal {
             .truncate(false)
             .open(&log_path)?;
 
-        let header = WalHeader {
-            last_checkpoint_lsn: 0,
-            next_lsn: 0,
-            next_txn_id: 0,
+        let existing_len = log_file.metadata()?.len();
+
+        let header = if existing_len == 0 {
+            // fresh WAL, never initialized
+            let h = WalHeader {
+                last_checkpoint_lsn: 0,
+                last_wal_offset: WAL_HEADER_SIZE as u64,
+                last_wal_len: 0,
+                next_lsn: 0,
+            };
+            let mut buf = [0u8; WAL_HEADER_SIZE];
+            h.serialize(&mut buf);
+            log_file.write_all_at(&buf, 0)?;
+            h
+        } else if existing_len >= WAL_HEADER_SIZE as u64 {
+            // existing WAL
+            let mut buf = [0u8; WAL_HEADER_SIZE];
+            log_file.read_exact_at(&mut buf, 0)?;
+            WalHeader::deserialize(&buf).ok_or("corrupt wal header")?
+        } else {
+            // 1..WAL_HEADER_SIZE bytes; torn/corrupted
+            return Err("wal file exists but header is truncated/corrupt".into());
         };
-
-        let mut buf = [0u8; WAL_HEADER_SIZE];
-        header.serialize(&mut buf);
-
-        log_file.write_all_at(&buf, 0)?;
 
         Ok(Self {
             log_file,
             log_path,
             header,
         })
+    }
+
+    pub fn write_record(
+        &mut self,
+        txn_id: u64,
+        record_type: RecordType,
+        page_id: u64,
+        is_index: bool,
+        payload: UpdatePayload,
+    ) -> Result<u64, Box<dyn Error>> {
+        let lsn = self.header.next_lsn;
+        self.header.next_lsn += 1;
+
+        let total_payload_len = payload.undo_data.len() + payload.redo_data.len() + 4;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(WAL_RECORD_HEADER_SIZE + total_payload_len);
+        let rec_offset = self.header.last_wal_offset + self.header.last_wal_len as u64;
+
+        let wal_rec_header = WalRecordHeader {
+            lsn,
+            prev_record_len: self.header.last_wal_len,
+            txn_id,
+            record_type,
+            page_id,
+            is_index,
+            payload_len: total_payload_len as u32,
+            payload_page_offset: payload.offset_in_page,
+        };
+
+        // TODO: make this atomic
+        self.header.last_wal_len = (total_payload_len + WAL_RECORD_HEADER_SIZE) as u32;
+        self.header.last_wal_offset = rec_offset;
+
+        Ok(lsn)
     }
 }

@@ -1,18 +1,18 @@
 use crate::storage::engine::read_intensive::bplus_tree::slotted_page::HeapPage;
 
 pub(crate) const HEAP_HEADER_SIZE: usize = 21;
-pub(crate) const WAL_HEADER_SIZE: usize = 21;
+pub(crate) const WAL_HEADER_SIZE: usize = 28;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum PageKind {
+pub(crate) enum PageKind {
     Root = 0,
     Internal = 1,
     Leaf = 2,
 }
 
 impl PageKind {
-    fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(PageKind::Root),
             1 => Some(PageKind::Internal),
@@ -96,21 +96,25 @@ pub(super) struct HeapHeader {
     /// `ptr` will also behave differently depending
     /// on the flags.
     /// As a convention, if the first bit of the flag is 1,
-    /// that would mean that THIS page is a primary page, else it's an overflow page.
+    /// that would mean that THIS page is a primary page, else it's an overflow
+    /// page.
     ///
-    /// If the second bit of the flag is 1 that would mean that this page HAS an overflow page.
+    /// If the second bit of the flag is 1 that would mean that this page HAS
+    /// an overflow page.
     ///
     /// So depending on the flags we have this combination (FB = flag bit)
     ///
-    /// FB\[0\] == true && FB\[1\] == false: A primary page, where `ptr` indicates nothing and shouldn't be read.
+    /// FB\[0\] == true && FB\[1\] == false: A primary page, where `ptr`
+    /// indicates nothing and shouldn't be read.
     ///
-    /// FB\[0\] == true && FB\[1\] == true: A primary page that has an overflow page, where `ptr`
-    /// indicated the page id of the overflow'd page.
+    /// FB\[0\] == true && FB\[1\] == true: A primary page that has an overflow
+    /// page, where `ptr` indicated the page id of the overflow'd page.
     ///
-    /// FB\[0\] == false && FB\[1\] == true: An overflow page that has an overflow page, where `ptr`
-    /// indicated the page id of the overflow'd page.
+    /// FB\[0\] == false && FB\[1\] == true: An overflow page that has an
+    /// overflow page, where `ptr` indicated the page id of the overflow'd page.
     ///
-    /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have an overflow page, where `ptr` indicates nothing.
+    /// FB\[0\] == false && FB\[1\] == false: An overflow page that doesn't have
+    /// an overflow page, where `ptr` indicates nothing.
     pub ptr: u64,
 } // 21
 
@@ -172,22 +176,27 @@ impl HeapHeader {
 
 pub(super) struct WalHeader {
     pub last_checkpoint_lsn: u64,
-    pub next_lsn: u64,
-    pub next_txn_id: u64,
+    pub last_wal_offset: u64, // we can use this to trace the last WAL and walk back
+    pub last_wal_len: u32,
+    pub next_lsn: u64, // NOTE: future me, make sure you flush this only when
+                       //  the buffer pool is supposed to be flushed (forced by
+                       //  the data page) or checkpointing..
 }
 
 impl WalHeader {
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
         Some(Self {
             last_checkpoint_lsn: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            next_lsn: u64::from_le_bytes(buf[8..16].try_into().ok()?),
-            next_txn_id: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            last_wal_offset: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            last_wal_len: u32::from_le_bytes(buf[16..20].try_into().ok()?),
+            next_lsn: u64::from_le_bytes(buf[20..28].try_into().ok()?),
         })
     }
 
     pub fn serialize(&self, buf: &mut [u8]) {
         buf[0..8].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.next_lsn.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.next_txn_id.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.last_wal_offset.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.last_wal_len.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.next_lsn.to_le_bytes());
     }
 }
