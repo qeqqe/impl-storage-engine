@@ -13,6 +13,7 @@ pub(super) mod index;
 pub(super) mod pager;
 pub(super) mod slotted_page;
 pub(super) mod wal;
+pub(super) mod wal_buffer;
 
 pub(super) const PAGE_SIZE: usize = 4096;
 pub(super) const HEADER_SIZE: usize = 8 + 2 + 2 + 1 + 1 + 8;

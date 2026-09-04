@@ -28,10 +28,12 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use crate::storage::engine::read_intensive::bplus_tree::PageKind;
+use crate::storage::engine::read_intensive::bplus_tree::wal_buffer::WalBuffer;
 
 use super::{buffer_pool::BufferPool, header::WAL_HEADER_SIZE, header::WalHeader};
 
 pub const WAL_RECORD_HEADER_SIZE: usize = 8 + 4 + 8 + 1 + 1 + 8 + 4 + 2; // 36 bytes
+pub const WAL_POOL_CAPACITY: usize = 10_000;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,7 @@ impl<'a> UpdatePayload<'a> {
 pub(super) struct Wal {
     pub log_file: File,
     pub log_path: PathBuf,
+    pub wal_buffer: WalBuffer,
     pub header: WalHeader,
 }
 
@@ -166,9 +169,16 @@ impl Wal {
             return Err("wal file exists but header is truncated/corrupt".into());
         };
 
+        let wal_buffer = WalBuffer {
+            buffer: Vec::new(),
+            offsets: Vec::new(),
+            max_frames: WAL_POOL_CAPACITY,
+        };
+
         Ok(Self {
             log_file,
             log_path,
+            wal_buffer,
             header,
         })
     }
@@ -187,6 +197,7 @@ impl Wal {
         let total_payload_len = payload.undo_data.len() + payload.redo_data.len() + 4;
 
         let mut buf: Vec<u8> = Vec::with_capacity(WAL_RECORD_HEADER_SIZE + total_payload_len);
+
         let rec_offset = self.header.last_wal_offset + self.header.last_wal_len as u64;
 
         let wal_rec_header = WalRecordHeader {
@@ -199,10 +210,20 @@ impl Wal {
             payload_len: total_payload_len as u32,
             payload_page_offset: payload.offset_in_page,
         };
+        let mut wal_rec_buff = [0u8; WAL_RECORD_HEADER_SIZE];
+        wal_rec_header.serialize(&mut wal_rec_buff);
+
+        buf.extend_from_slice(&wal_rec_buff);
+        buf.extend_from_slice(&(payload.undo_data.len() as u16).to_le_bytes());
+        buf.extend_from_slice(payload.undo_data);
+        buf.extend_from_slice(&(payload.redo_data.len() as u16).to_le_bytes());
+        buf.extend_from_slice(payload.redo_data);
 
         // TODO: make this atomic
         self.header.last_wal_len = (total_payload_len + WAL_RECORD_HEADER_SIZE) as u32;
         self.header.last_wal_offset = rec_offset;
+
+        self.wal_buffer.insert(&buf, lsn, rec_offset as usize);
 
         Ok(lsn)
     }
