@@ -15,11 +15,15 @@ pub(super) struct Index {
 
 impl Index {
     pub fn new(index_file: File, index_path: PathBuf) -> Self {
+        let next_id = index_file
+            .metadata()
+            .map(|m| m.len() / PAGE_SIZE as u64)
+            .unwrap_or(0);
         Index {
             index_file,
             index_path,
             pool: BufferPool::new(INDEX_POOL_CAPACITY),
-            next_id: 0,
+            next_id,
         }
     }
 

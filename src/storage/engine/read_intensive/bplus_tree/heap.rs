@@ -32,10 +32,14 @@ pub(super) struct Heap {
 
 impl Heap {
     pub fn new(heap_file: File, path: std::path::PathBuf) -> Self {
+        let next_id = heap_file
+            .metadata()
+            .map(|m| m.len() / PAGE_SIZE as u64)
+            .unwrap_or(0);
         Heap {
             heap_file,
             path,
-            next_id: 0,
+            next_id,
             pool: BufferPool::new(HEAP_POOL_CAPACITY),
         }
     }

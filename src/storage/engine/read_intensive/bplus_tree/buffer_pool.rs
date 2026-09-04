@@ -15,12 +15,16 @@ pub(super) struct BufferPool<P> {
 struct FrameEntry<P> {
     page: P,
     pin_count: u32,
+    page_lsn: u64,
+    rec_lsn: u64,
 }
 
 pub(super) struct EvictedPage<P> {
     pub id: u64,
     pub page: P,
     pub was_dirty: bool,
+    pub page_lsn: u64,
+    pub rec_lsn: u64,
 }
 
 impl<P> BufferPool<P> {
@@ -56,7 +60,15 @@ impl<P> BufferPool<P> {
             None
         };
 
-        self.frames.insert(id, FrameEntry { page, pin_count: 0 });
+        self.frames.insert(
+            id,
+            FrameEntry {
+                page,
+                pin_count: 0,
+                page_lsn: 0,
+                rec_lsn: 0,
+            },
+        );
         self.lru_order.retain(|&x| x != id);
         self.lru_order.push_back(id);
 
@@ -69,6 +81,41 @@ impl<P> BufferPool<P> {
 
     pub fn is_dirty(&self, id: u64) -> bool {
         self.dirty.get(&id).copied().unwrap_or(false)
+    }
+
+    pub fn update_lsn(&mut self, id: u64, lsn: u64) {
+        if let Some(entry) = self.frames.get_mut(&id) {
+            if entry.rec_lsn == 0 {
+                entry.rec_lsn = lsn;
+            }
+            entry.page_lsn = lsn;
+            self.dirty.insert(id, true);
+        }
+        self.touch(id);
+    }
+
+    pub fn page_lsn(&self, id: u64) -> u64 {
+        self.frames.get(&id).map(|e| e.page_lsn).unwrap_or(0)
+    }
+
+    pub fn rec_lsn(&self, id: u64) -> u64 {
+        self.frames.get(&id).map(|e| e.rec_lsn).unwrap_or(0)
+    }
+
+    pub fn set_lsn_explicit(&mut self, id: u64, page_lsn: u64, rec_lsn: u64) {
+        if let Some(entry) = self.frames.get_mut(&id) {
+            entry.page_lsn = page_lsn;
+            entry.rec_lsn = rec_lsn;
+        }
+    }
+
+    pub fn dirty_page_table(&self) -> Vec<(u64, u64)> {
+        let mut dpt = Vec::new();
+        for &id in self.dirty.keys() {
+            let rec_lsn = self.frames.get(&id).map(|e| e.rec_lsn).unwrap_or(0);
+            dpt.push((id, rec_lsn));
+        }
+        dpt
     }
 
     pub fn drain_dirty(&mut self) -> Vec<(u64, &P)> {
@@ -84,10 +131,16 @@ impl<P> BufferPool<P> {
 
     pub fn clear_dirty(&mut self) {
         self.dirty.clear();
+        for entry in self.frames.values_mut() {
+            entry.rec_lsn = 0;
+        }
     }
 
     pub fn clear_dirty_single(&mut self, id: u64) {
         self.dirty.remove(&id);
+        if let Some(entry) = self.frames.get_mut(&id) {
+            entry.rec_lsn = 0;
+        }
     }
 
     pub fn pin(&mut self, id: u64) {
@@ -136,6 +189,8 @@ impl<P> BufferPool<P> {
                 id,
                 page: entry.page,
                 was_dirty,
+                page_lsn: entry.page_lsn,
+                rec_lsn: entry.rec_lsn,
             })
         } else {
             None

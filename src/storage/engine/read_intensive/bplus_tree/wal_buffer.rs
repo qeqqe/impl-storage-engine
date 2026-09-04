@@ -16,21 +16,27 @@
 //! NOTE: About, checkpointing method; i'm leaning towards having fuzzy
 //! checkpointing,
 
-use std::{collections::BTreeMap, error::Error};
-
 use super::wal::WalRecordHeader;
 
 pub(crate) struct WalBuffer {
     pub(super) buffer: Vec<u8>,
-    /// when we have to flush till LSN x, we find the offset of LSN x by,
-    /// `x_off = offset[offset[0].0 - x].1`
-    /// now to find the relative offset in the buffer we do,
-    /// `buffer[0..x_off - offset[0].1]`
+    // when we have to flush till LSN x, we find the offset of LSN x by,
+    // `x_off = offset[offset[0].0 - x].1`
+    // now to find the relative offset in the buffer we do,
+    // `buffer[0..x_off - offset[0].1]`
     pub(super) offsets: Vec<(u64, usize)>,
     pub(super) max_frames: usize,
 }
 
 impl WalBuffer {
+    pub fn new(max_frames: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            offsets: Vec::new(),
+            max_frames,
+        }
+    }
+
     pub fn contains(&self, lsn: u64) -> bool {
         let (Some(first), Some(last)) = (self.offsets.first(), self.offsets.last()) else {
             return false;
@@ -39,11 +45,28 @@ impl WalBuffer {
         (first.0..=last.0).contains(&lsn)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.offsets.len() >= self.max_frames
+    }
+
     pub fn insert(&mut self, buf: &[u8], lsn: u64, rec_offset: usize) {
-        if self.max_frames == self.offsets.len() {
-            todo!("flush or something ")
-        }
         self.buffer.extend_from_slice(buf);
         self.offsets.push((lsn, rec_offset));
+    }
+
+    pub fn first_lsn(&self) -> Option<u64> {
+        self.offsets.first().map(|&(lsn, _)| lsn)
+    }
+
+    pub fn last_lsn(&self) -> Option<u64> {
+        self.offsets.last().map(|&(lsn, _)| lsn)
     }
 }

@@ -174,6 +174,7 @@ impl HeapHeader {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WalHeader {
     pub last_checkpoint_lsn: u64,
     pub last_wal_offset: u64, // we can use this to trace the last WAL and walk back
