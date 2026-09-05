@@ -420,7 +420,11 @@ impl BplusTree {
         }
     }
 
-    fn delete(&mut self, key: u64) -> Result<(), Box<dyn Error>> {
+    pub fn delete(&mut self, key: u64) -> Result<(), Box<dyn Error>> {
+        self.delete_with_txn(0, key)
+    }
+
+    pub fn delete_with_txn(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
         let crumbs = self.breadcrumbs(key)?;
 
         if !crumbs.found {
@@ -433,17 +437,20 @@ impl BplusTree {
             return Err("Empty breadcrumb trail".into());
         };
 
-        let (removed_cell, remaining) = {
+        let old_leaf_data = self.pager.index.fetch(leaf_id).data;
+        let remaining = {
             let leaf_page = self.pager.index.fetch_mut(leaf_id);
             let cells = leaf_page.get_cells()?;
             let idx = cells
                 .binary_search_by(|c| c.key.cmp(&key))
                 .map_err(|_| "Key not found in leaf page")?;
 
-            let removed = leaf_page.remove_cell_at(idx)?;
-            let n = leaf_page.num_cells()?;
-            (removed, n)
+            leaf_page.remove_cell_at(idx)?;
+            leaf_page.num_cells()?
         };
+        let new_leaf_data = self.pager.index.fetch(leaf_id).data;
+        self.pager
+            .log_index_diff(txn_id, leaf_id, &old_leaf_data, &new_leaf_data)?;
 
         if leaf_id == self.root_id {
             return Ok(());
@@ -451,17 +458,18 @@ impl BplusTree {
 
         // if there's no underfull just propogate the key up the tree
         if remaining >= DEGREE {
-            self.propagate_key_update(key, leaf_id, &trail)?;
+            self.propagate_key_update(txn_id, key, leaf_id, &trail)?;
             return Ok(());
         }
 
-        self.handle_underfull(leaf_id, &mut trail)?;
+        self.handle_underfull(txn_id, leaf_id, &mut trail)?;
 
         Ok(())
     }
 
     fn propagate_key_update(
         &mut self,
+        txn_id: u64,
         old_key: u64,
         child_id: u64,
         ancestors: &[u64],
@@ -487,27 +495,33 @@ impl BplusTree {
             };
 
             if let Some(idx) = found_idx {
-                let page = self.pager.index.fetch_mut(ancestor_id);
-                let hdr = page.header()?;
-                let cells = page.get_cells()?;
+                let old_data = self.pager.index.fetch(ancestor_id).data;
+                let new_data = {
+                    let page = self.pager.index.fetch_mut(ancestor_id);
+                    let hdr = page.header()?;
+                    let cells = page.get_cells()?;
 
-                let updated_cells: Vec<Cell> = cells
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        if i == idx {
-                            Cell {
-                                key: new_first_key,
-                                c_ptr: c.c_ptr,
-                                h_ptr: c.h_ptr,
+                    let updated_cells: Vec<Cell> = cells
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if i == idx {
+                                Cell {
+                                    key: new_first_key,
+                                    c_ptr: c.c_ptr,
+                                    h_ptr: c.h_ptr,
+                                }
+                            } else {
+                                c
                             }
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
+                        })
+                        .collect();
 
-                page.rebuild_from_cells(&updated_cells, hdr.page_ty, hdr.id, hdr.ptr)?;
+                    page.rebuild_from_cells(&updated_cells, hdr.page_ty, hdr.id, hdr.ptr)?;
+                    page.data
+                };
+                self.pager
+                    .log_index_diff(txn_id, ancestor_id, &old_data, &new_data)?;
 
                 // there will only be ONE occurence at MAX so just
                 // exit when you find one.
@@ -520,6 +534,7 @@ impl BplusTree {
 
     fn handle_underfull(
         &mut self,
+        txn_id: u64,
         underfull_id: u64,
         ancestors: &mut Vec<u64>,
     ) -> Result<(), Box<dyn Error>> {
@@ -553,6 +568,7 @@ impl BplusTree {
 
             if left_cells.len() > DEGREE {
                 return self.redistribute_from_left(
+                    txn_id,
                     left_id,
                     underfull_id,
                     parent_id,
@@ -570,6 +586,7 @@ impl BplusTree {
 
             if right_cells.len() > DEGREE {
                 return self.redistribute_from_right(
+                    txn_id,
                     underfull_id,
                     right_id,
                     parent_id,
@@ -580,9 +597,23 @@ impl BplusTree {
         }
 
         if let Some(left_id) = left_sibling_id {
-            self.merge_with_left(left_id, underfull_id, parent_id, child_idx, ancestors)?;
+            self.merge_with_left(
+                txn_id,
+                left_id,
+                underfull_id,
+                parent_id,
+                child_idx,
+                ancestors,
+            )?;
         } else if let Some(right_id) = right_sibling_id {
-            self.merge_with_right(underfull_id, right_id, parent_id, child_idx, ancestors)?;
+            self.merge_with_right(
+                txn_id,
+                underfull_id,
+                right_id,
+                parent_id,
+                child_idx,
+                ancestors,
+            )?;
         }
 
         Ok(())
@@ -642,6 +673,7 @@ impl BplusTree {
 
     fn redistribute_from_left(
         &mut self,
+        txn_id: u64,
         left_id: u64,
         underfull_id: u64,
         parent_id: u64,
@@ -730,6 +762,7 @@ impl BplusTree {
 
     fn redistribute_from_right(
         &mut self,
+        txn_id: u64,
         underfull_id: u64,
         right_id: u64,
         parent_id: u64,
@@ -791,6 +824,7 @@ impl BplusTree {
 
     fn merge_with_left(
         &mut self,
+        txn_id: u64,
         left_id: u64,
         underfull_id: u64,
         parent_id: u64,
@@ -922,6 +956,7 @@ impl BplusTree {
 
     fn merge_with_right(
         &mut self,
+        txn_id: u64,
         underfull_id: u64,
         right_id: u64,
         parent_id: u64,
@@ -1057,6 +1092,7 @@ impl BplusTree {
 
     fn check_parent_underfull(
         &mut self,
+        txn_id: u64,
         parent_id: u64,
         ancestors: &mut Vec<u64>,
     ) -> Result<(), Box<dyn Error>> {
