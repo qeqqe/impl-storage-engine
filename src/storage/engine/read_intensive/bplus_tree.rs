@@ -682,6 +682,7 @@ impl BplusTree {
     ) -> Result<(), Box<dyn Error>> {
         let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
 
+        let old_left_data = self.pager.index.fetch(left_id).data;
         let (borrowed_cell, separator_idx) = {
             let left_page = self.pager.index.fetch_mut(left_id);
             let left_cells = left_page.get_cells()?;
@@ -691,11 +692,23 @@ impl BplusTree {
         };
 
         if is_leaf {
+            let new_left_data = self.pager.index.fetch(left_id).data;
+            self.pager
+                .log_index_diff(txn_id, left_id, &old_left_data, &new_left_data)?;
+
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
                 underfull_page.add_cell(borrowed_cell.key, value)?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
             let new_separator = {
                 let underfull_page = self.pager.index.fetch(underfull_id);
@@ -706,11 +719,15 @@ impl BplusTree {
                     .key
             };
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(new_separator, left_id)?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         } else {
             let parent_sep_key = {
                 let parent_page = self.pager.index.fetch(parent_id);
@@ -723,6 +740,7 @@ impl BplusTree {
                 left_page.header()?.ptr
             };
 
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
 
@@ -742,12 +760,23 @@ impl BplusTree {
                     underfull_hdr.ptr,
                 )?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(borrowed_cell.key, left_id)?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
 
             {
                 let left_page = self.pager.index.fetch_mut(left_id);
@@ -755,6 +784,9 @@ impl BplusTree {
                     left_page.set_header_ptr(c)?;
                 }
             }
+            let new_left_data = self.pager.index.fetch(left_id).data;
+            self.pager
+                .log_index_diff(txn_id, left_id, &old_left_data, &new_left_data)?;
         }
 
         Ok(())
@@ -771,6 +803,7 @@ impl BplusTree {
     ) -> Result<(), Box<dyn Error>> {
         let is_leaf = underfull_hdr.page_ty == PageKind::Leaf;
 
+        let old_right_data = self.pager.index.fetch(right_id).data;
         let borrowed_cell = {
             let right_page = self.pager.index.fetch_mut(right_id);
             right_page.remove_cell_at(0)?
@@ -779,11 +812,23 @@ impl BplusTree {
         let separator_idx = child_idx;
 
         if is_leaf {
+            let new_right_data = self.pager.index.fetch(right_id).data;
+            self.pager
+                .log_index_diff(txn_id, right_id, &old_right_data, &new_right_data)?;
+
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
                 underfull_page.add_cell(borrowed_cell.key, value)?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
             let new_separator = {
                 let right_page = self.pager.index.fetch(right_id);
@@ -791,12 +836,20 @@ impl BplusTree {
                 cells.first().ok_or("Empty right after redistribute")?.key
             };
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(new_separator, underfull_id)?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         } else {
+            let new_right_data = self.pager.index.fetch(right_id).data;
+            self.pager
+                .log_index_diff(txn_id, right_id, &old_right_data, &new_right_data)?;
+
             let parent_sep_key = {
                 let parent_page = self.pager.index.fetch(parent_id);
                 let parent_cells = parent_page.get_cells()?;
@@ -805,18 +858,30 @@ impl BplusTree {
 
             let borrowed_left_child = borrowed_cell.c_ptr.ok_or("Missing c_ptr")?;
 
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let old_ptr = underfull_page.header()?.ptr;
                 underfull_page.add_cell(parent_sep_key, old_ptr)?;
                 underfull_page.set_header_ptr(borrowed_left_child)?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(borrowed_cell.key, underfull_id)?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         }
 
         Ok(())
@@ -853,6 +918,7 @@ impl BplusTree {
             merged.extend(left_cells);
             merged.extend(underfull_cells);
 
+            let old_left_data = self.pager.index.fetch(left_id).data;
             {
                 let left_page = self.pager.index.fetch_mut(left_id);
                 left_page.rebuild_from_cells(
@@ -862,7 +928,11 @@ impl BplusTree {
                     underfull_hdr.ptr,
                 )?;
             }
+            let new_left_data = self.pager.index.fetch(left_id).data;
+            self.pager
+                .log_index_diff(txn_id, left_id, &old_left_data, &new_left_data)?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
 
@@ -893,6 +963,9 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         } else {
             let parent_sep_key = {
                 let parent_page = self.pager.index.fetch(parent_id);
@@ -909,6 +982,7 @@ impl BplusTree {
             });
             merged.extend(underfull_cells);
 
+            let old_left_data = self.pager.index.fetch(left_id).data;
             {
                 let left_page = self.pager.index.fetch_mut(left_id);
                 left_page.rebuild_from_cells(
@@ -918,7 +992,11 @@ impl BplusTree {
                     underfull_hdr.ptr,
                 )?;
             }
+            let new_left_data = self.pager.index.fetch(left_id).data;
+            self.pager
+                .log_index_diff(txn_id, left_id, &old_left_data, &new_left_data)?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
 
@@ -949,9 +1027,12 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         }
 
-        self.check_parent_underfull(parent_id, ancestors)
+        self.check_parent_underfull(txn_id, parent_id, ancestors)
     }
 
     fn merge_with_right(
@@ -985,6 +1066,7 @@ impl BplusTree {
             merged.extend(underfull_cells);
             merged.extend(right_cells);
 
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
                 underfull_page.rebuild_from_cells(
@@ -994,7 +1076,15 @@ impl BplusTree {
                     right_hdr.ptr,
                 )?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
 
@@ -1027,6 +1117,9 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         } else {
             let parent_sep_key = {
                 let parent_page = self.pager.index.fetch(parent_id);
@@ -1043,6 +1136,7 @@ impl BplusTree {
             });
             merged.extend(right_cells);
 
+            let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
                 let underfull_page = self.pager.index.fetch_mut(underfull_id);
                 underfull_page.rebuild_from_cells(
@@ -1052,7 +1146,15 @@ impl BplusTree {
                     right_hdr.ptr,
                 )?;
             }
+            let new_underfull_data = self.pager.index.fetch(underfull_id).data;
+            self.pager.log_index_diff(
+                txn_id,
+                underfull_id,
+                &old_underfull_data,
+                &new_underfull_data,
+            )?;
 
+            let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
 
@@ -1085,9 +1187,12 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
             }
+            let new_parent_data = self.pager.index.fetch(parent_id).data;
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
         }
 
-        self.check_parent_underfull(parent_id, ancestors)
+        self.check_parent_underfull(txn_id, parent_id, ancestors)
     }
 
     fn check_parent_underfull(
@@ -1105,10 +1210,14 @@ impl BplusTree {
             };
 
             if root_cells_empty {
+                let old_root_data = self.pager.index.fetch(new_root_id).data;
                 {
                     let new_root = self.pager.index.fetch_mut(new_root_id);
                     new_root.set_page_kind(PageKind::Root)?;
                 }
+                let new_root_data = self.pager.index.fetch(new_root_id).data;
+                self.pager
+                    .log_index_diff(txn_id, new_root_id, &old_root_data, &new_root_data)?;
 
                 self.root_id = new_root_id;
             }
@@ -1123,7 +1232,7 @@ impl BplusTree {
 
         if remaining < DEGREE {
             ancestors.pop();
-            self.handle_underfull(parent_id, ancestors)?;
+            self.handle_underfull(txn_id, parent_id, ancestors)?;
         }
 
         Ok(())
