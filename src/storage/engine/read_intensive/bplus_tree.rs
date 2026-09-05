@@ -39,17 +39,68 @@ struct BplusTree {
 
 impl BplusTree {
     pub fn new(index_path: PathBuf, heap_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let mut pager = Pager::new(index_path, heap_path)?;
-        let root_id = pager.index.allocate(PageKind::Root);
+        let wal_path = index_path.with_file_name("wal_file.db");
+        Self::new_with_wal(index_path, heap_path, wal_path)
+    }
 
-        {
-            let root_page = pager.index.fetch_mut(root_id);
+    pub fn new_with_wal(
+        index_path: PathBuf,
+        heap_path: PathBuf,
+        wal_path: PathBuf,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut pager = Pager::new_with_wal(index_path, heap_path, wal_path)?;
+        let root_id = if pager.index.next_id > 0 {
+            let mut found_root = 0;
+            for id in 0..pager.index.next_id {
+                if let Ok(hdr) = pager.index.fetch(id).header()
+                    && hdr.page_ty == PageKind::Root
+                {
+                    found_root = id;
+                    break;
+                }
+            }
+            found_root
+        } else {
+            let id = pager.index.allocate(PageKind::Root);
+            let root_page = pager.index.fetch_mut(id);
             let mut hdr = root_page.header()?;
             hdr.set_root_leaf();
             hdr.serialize(&mut root_page.data[..HEADER_SIZE]);
-        }
+            let new_data = root_page.data;
+            pager.log_index_diff(0, id, &[0u8; PAGE_SIZE], &new_data)?;
+            id
+        };
 
         Ok(Self { root_id, pager })
+    }
+
+    pub fn begin_transaction(&mut self) -> Result<u64, Box<dyn Error>> {
+        self.pager.wal.begin_transaction()
+    }
+
+    pub fn commit_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        self.pager.wal.commit_transaction(txn_id)
+    }
+
+    pub fn abort_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        self.pager.wal.abort_transaction(txn_id)
+    }
+
+    pub fn fuzzy_checkpoint(&mut self) -> Result<u64, Box<dyn Error>> {
+        self.pager.fuzzy_checkpoint()
+    }
+
+    pub fn recover(&mut self) -> Result<pager::RecoveryReport, Box<dyn Error>> {
+        let report = self.pager.recover()?;
+        for id in 0..self.pager.index.next_id {
+            if let Ok(hdr) = self.pager.index.fetch(id).header()
+                && hdr.page_ty == PageKind::Root
+            {
+                self.root_id = id;
+                break;
+            }
+        }
+        Ok(report)
     }
 
     /// Traverses the tree, finds the cell content in page
@@ -108,6 +159,15 @@ impl BplusTree {
     // inserted item for a better labled addressing of the data memebers,
     // updates can mess up things if we're not careful withi it.
     pub fn insert(&mut self, key: u64, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+        self.insert_with_txn(0, key, data_records)
+    }
+
+    pub fn insert_with_txn(
+        &mut self,
+        txn_id: u64,
+        key: u64,
+        data_records: Vec<Vec<u8>>,
+    ) -> Result<(), Box<dyn Error>> {
         let mut breadcrumbs = self.breadcrumbs(key)?;
 
         if breadcrumbs.found {
@@ -126,19 +186,28 @@ impl BplusTree {
         let heap_page_id = self.pager.heap.allocate();
         {
             let heap_page = self.pager.heap.fetch_mut(heap_page_id)?;
+            let old_data = heap_page.data;
             heap_page.add_records(data_records)?;
+            let new_data = heap_page.data;
+            self.pager
+                .log_heap_diff(txn_id, heap_page_id, &old_data, &new_data)?;
         }
 
         // now we can store the cell in the index page itself.
         let n_slot = {
             let page = self.pager.index.fetch_mut(index_page_id);
-            page.add_cell(key, heap_page_id)?
+            let old_data = page.data;
+            let n_slot = page.add_cell(key, heap_page_id)?;
+            let new_data = page.data;
+            self.pager
+                .log_index_diff(txn_id, index_page_id, &old_data, &new_data)?;
+            n_slot
         };
 
         if n_slot >= ORDER {
             // index page was popped off so we need to re-insert
             breadcrumbs.push(index_page_id);
-            match self.handle_overfull(&mut breadcrumbs)? {
+            match self.handle_overfull(txn_id, &mut breadcrumbs)? {
                 Some(new_id) => self.root_id = new_id,
                 None => return Ok(()),
             }
@@ -149,6 +218,7 @@ impl BplusTree {
 
     fn handle_overfull(
         &mut self,
+        txn_id: u64,
         breadcrumbs: &mut Vec<u64>,
     ) -> Result<Option<u64>, Box<dyn Error>> {
         let Some(overflow_page_id) = breadcrumbs.pop() else {
@@ -195,7 +265,8 @@ impl BplusTree {
                 .chain(right_cells.iter())
                 .collect();
 
-            {
+            let old_data = self.pager.index.fetch(overflow_page_id).data;
+            let new_data = {
                 let left_page = self.pager.index.fetch_mut(overflow_page_id);
                 left_page.rebuild_from_cells(
                     left_cells,
@@ -203,9 +274,13 @@ impl BplusTree {
                     overflow_page_id,
                     right_page_id,
                 )?;
-            }
+                left_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, overflow_page_id, &old_data, &new_data)?;
 
-            {
+            let old_data = self.pager.index.fetch(right_page_id).data;
+            let new_data = {
                 let right_page = self.pager.index.fetch_mut(right_page_id);
                 let right_data: Vec<Cell> = right_cells_with_promoted
                     .into_iter()
@@ -224,13 +299,17 @@ impl BplusTree {
                     right_page_id,
                     overflow_hdr.ptr,
                 )?;
-            }
+                right_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, right_page_id, &old_data, &new_data)?;
         } else {
             let promote_c_ptr = promote_cell
                 .c_ptr
                 .ok_or("Internal promote cell missing c_ptr")?;
 
-            {
+            let old_data = self.pager.index.fetch(overflow_page_id).data;
+            let new_data = {
                 let left_page = self.pager.index.fetch_mut(overflow_page_id);
                 left_page.rebuild_from_cells(
                     left_cells,
@@ -238,9 +317,13 @@ impl BplusTree {
                     overflow_page_id,
                     promote_c_ptr,
                 )?;
-            }
+                left_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, overflow_page_id, &old_data, &new_data)?;
 
-            {
+            let old_data = self.pager.index.fetch(right_page_id).data;
+            let new_data = {
                 let right_page = self.pager.index.fetch_mut(right_page_id);
                 let right_data: Vec<Cell> = right_cells
                     .iter()
@@ -257,11 +340,15 @@ impl BplusTree {
                     right_page_id,
                     overflow_hdr.ptr,
                 )?;
-            }
+                right_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, right_page_id, &old_data, &new_data)?;
         };
 
         if let Some(&parent_id) = breadcrumbs.last() {
-            let n_slot = {
+            let old_data = self.pager.index.fetch(parent_id).data;
+            let (n_slot, new_data) = {
                 let parent_page = self.pager.index.fetch_mut(parent_id);
                 let parent_hdr = parent_page.header()?;
 
@@ -294,29 +381,40 @@ impl BplusTree {
                     fixed_ptr,
                 )?;
 
-                parent_page.add_cell(promote_cell.key, overflow_page_id)?
+                let n_slot = parent_page.add_cell(promote_cell.key, overflow_page_id)?;
+                (n_slot, parent_page.data)
             };
+            self.pager
+                .log_index_diff(txn_id, parent_id, &old_data, &new_data)?;
 
             if n_slot >= ORDER {
-                self.handle_overfull(breadcrumbs)
+                self.handle_overfull(txn_id, breadcrumbs)
             } else {
                 Ok(None)
             }
         } else {
             let new_root_id = self.pager.index.allocate(PageKind::Root);
-            {
+            let old_data = self.pager.index.fetch(new_root_id).data;
+            let new_data = {
                 let root_page = self.pager.index.fetch_mut(new_root_id);
                 root_page.init_header(new_root_id, PageKind::Root, right_page_id);
                 root_page.add_cell(promote_cell.key, overflow_page_id)?;
-            }
+                root_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, new_root_id, &old_data, &new_data)?;
 
-            {
+            let old_data = self.pager.index.fetch(overflow_page_id).data;
+            let new_data = {
                 let left_page = self.pager.index.fetch_mut(overflow_page_id);
                 let hdr = left_page.header()?;
                 if hdr.page_ty == PageKind::Root {
                     left_page.set_page_kind(PageKind::Internal)?;
                 }
-            }
+                left_page.data
+            };
+            self.pager
+                .log_index_diff(txn_id, overflow_page_id, &old_data, &new_data)?;
 
             Ok(Some(new_root_id))
         }
@@ -1499,4 +1597,3 @@ mod test {
         assert_eq!(btree.get(1).unwrap(), vec![b"first".to_vec()]);
     }
 }
-
