@@ -5,11 +5,10 @@ use std::{
 };
 
 use super::{
-    buffer_pool::BufferPool,
     heap::Heap,
     index::Index,
     slotted_page::Cell,
-    wal::{self, DirtyPageEntry, RecordType, UpdatePayload, Wal},
+    wal::{DirtyPageEntry, RecordType, UpdatePayload, Wal},
 };
 
 pub struct RecoveryReport {
@@ -154,7 +153,7 @@ impl Pager {
         old_data: &[u8],
         new_data: &[u8],
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        if let Some((offset, start, end)) = page_diff(old_data, new_data) {
+        if let Some((offset, start, end)) = Self::page_diff(old_data, new_data) {
             let lsn = self.log_index_update(
                 txn_id,
                 page_id,
@@ -175,7 +174,7 @@ impl Pager {
         old_data: &[u8],
         new_data: &[u8],
     ) -> Result<Option<u64>, Box<dyn Error>> {
-        if let Some((offset, start, end)) = page_diff(old_data, new_data) {
+        if let Some((offset, start, end)) = Self::page_diff(old_data, new_data) {
             let lsn = self.log_heap_update(
                 txn_id,
                 page_id,
@@ -357,23 +356,22 @@ impl Pager {
             active_txns: active_list,
         })
     }
-}
-
-fn page_diff(old: &[u8], new: &[u8]) -> Option<(u16, usize, usize)> {
-    let mut start = None;
-    for i in 0..old.len() {
-        if old[i] != new[i] {
-            start = Some(i);
-            break;
+    fn page_diff(old: &[u8], new: &[u8]) -> Option<(u16, usize, usize)> {
+        let mut start = None;
+        for i in 0..old.len() {
+            if old[i] != new[i] {
+                start = Some(i);
+                break;
+            }
         }
-    }
-    let start = start?;
-    let mut end = start + 1;
-    for i in (start..old.len()).rev() {
-        if old[i] != new[i] {
-            end = i + 1;
-            break;
+        let start = start?;
+        let mut end = start + 1;
+        for i in (start..old.len()).rev() {
+            if old[i] != new[i] {
+                end = i + 1;
+                break;
+            }
         }
+        Some((start as u16, start, end))
     }
-    Some((start as u16, start, end))
 }

@@ -1,4 +1,4 @@
-#![allow(unused)]
+#![allow(dead_code)]
 
 use std::{error::Error, path::PathBuf};
 
@@ -32,7 +32,7 @@ const ORDER: usize = (PAGE_SIZE - HEADER_SIZE) / (KEY_SIZE + PTR_SIZE + SLOT_SIZ
 const FANOUT: usize = ORDER + 1;
 const DEGREE: usize = FANOUT / 2;
 
-struct BplusTree {
+pub struct BplusTree {
     root_id: u64,
     pager: Pager,
 }
@@ -168,7 +168,7 @@ impl BplusTree {
         key: u64,
         data_records: Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut breadcrumbs = self.breadcrumbs(key)?;
+        let breadcrumbs = self.breadcrumbs(key)?;
 
         if breadcrumbs.found {
             return Err("Key already exists".into());
@@ -1306,6 +1306,7 @@ mod test {
     use std::fs;
 
     use super::*;
+    use wal::RecordType;
 
     fn get_btree_in(dir: &std::path::Path) -> BplusTree {
         let heap_path = dir.join("heap_file.db");
@@ -1740,5 +1741,322 @@ mod test {
 
         // 1 was flushed... so refetching from disk should wokr..
         assert_eq!(btree.get(1).unwrap(), vec![b"first".to_vec()]);
+    }
+
+    #[test]
+    fn wal_transaction_commit_and_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        assert_eq!(t1, 1);
+        btree
+            .insert_with_txn(t1, 1, vec![b"val1".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t1).unwrap();
+
+        let t2 = btree.begin_transaction().unwrap();
+        assert_eq!(t2, 2);
+        btree
+            .insert_with_txn(t2, 2, vec![b"val2".to_vec()])
+            .unwrap();
+        btree.abort_transaction(t2).unwrap();
+
+        let records = btree.pager.wal.read_all_records().unwrap();
+        assert!(!records.is_empty());
+        assert!(
+            records
+                .iter()
+                .any(|r| r.header.record_type == RecordType::Commit && r.header.txn_id == t1)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.header.record_type == RecordType::Abort && r.header.txn_id == t2)
+        );
+    }
+
+    #[test]
+    fn wal_steal_flush_lsn_invariant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1, 42, vec![b"val42".to_vec()])
+            .unwrap();
+
+        let (idx_dirty, _) = btree.pager.dirty_pages();
+        assert!(!idx_dirty.is_empty());
+
+        for page_id in idx_dirty {
+            let page_lsn = btree.pager.index.pool.page_lsn(page_id);
+            assert!(page_lsn > 0);
+            btree.pager.flush_index_page(page_id).unwrap();
+            assert!(btree.pager.wal.flushed_lsn >= page_lsn);
+        }
+    }
+
+    #[test]
+    fn fuzzy_checkpointing_preserves_dirty_pages_and_records_dpt_att() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1, 100, vec![b"hello".to_vec()])
+            .unwrap();
+
+        let t2 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t2, 200, vec![b"world".to_vec()])
+            .unwrap();
+
+        let cp_lsn = btree.fuzzy_checkpoint().unwrap();
+        assert!(cp_lsn > 0);
+        assert_eq!(btree.pager.wal.header.last_checkpoint_lsn, cp_lsn);
+
+        let all = btree.pager.wal.read_all_records().unwrap();
+        let cp_rec = all.iter().find(|r| r.header.lsn == cp_lsn).unwrap();
+        assert_eq!(cp_rec.header.record_type, RecordType::Checkpoint);
+
+        let cp_data = cp_rec.parse_checkpoint().unwrap();
+        assert!(cp_data.att.iter().any(|a| a.txn_id == t1));
+        assert!(cp_data.att.iter().any(|a| a.txn_id == t2));
+        assert!(!cp_data.dpt.is_empty());
+        for d in &cp_data.dpt {
+            assert!(d.rec_lsn > 0);
+        }
+
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        assert!(!idx_dirty.is_empty());
+        assert!(!heap_dirty.is_empty());
+    }
+
+    #[test]
+    fn crash_recovery_redo_and_undo_with_fuzzy_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1, 10, vec![b"val10".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t1).unwrap();
+
+        let cp_lsn = btree.fuzzy_checkpoint().unwrap();
+        assert!(cp_lsn > 0);
+
+        let t2 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t2, 20, vec![b"val20".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t2).unwrap();
+
+        let t3 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t3, 30, vec![b"val30".to_vec()])
+            .unwrap();
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+
+        assert_eq!(btree.get(10).unwrap(), vec![b"val10".to_vec()]);
+        assert_eq!(btree.get(20).unwrap(), vec![b"val20".to_vec()]);
+        assert!(btree.get(30).is_err());
+    }
+
+    #[test]
+    fn crash_recovery_undo_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1, 10, vec![b"val10".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t1).unwrap();
+
+        let t1b = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1b, 20, vec![b"val20".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t1b).unwrap();
+
+        btree.fuzzy_checkpoint().unwrap();
+
+        let t2 = btree.begin_transaction().unwrap();
+        btree.delete_with_txn(t2, 10).unwrap();
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+
+        assert_eq!(btree.get(10).unwrap(), vec![b"val10".to_vec()]);
+        assert_eq!(btree.get(20).unwrap(), vec![b"val20".to_vec()]);
+    }
+
+    #[test]
+    fn fuzzy_checkpoint_recovery_idempotence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t1, 5, vec![b"val5".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t1).unwrap();
+
+        btree.fuzzy_checkpoint().unwrap();
+
+        let t2 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t2, 6, vec![b"val6".to_vec()])
+            .unwrap();
+        btree.commit_transaction(t2).unwrap();
+
+        let t3 = btree.begin_transaction().unwrap();
+        btree
+            .insert_with_txn(t3, 7, vec![b"val7".to_vec()])
+            .unwrap();
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+        assert_eq!(btree.get(5).unwrap(), vec![b"val5".to_vec()]);
+        assert_eq!(btree.get(6).unwrap(), vec![b"val6".to_vec()]);
+        assert!(btree.get(7).is_err());
+
+        btree.recover().unwrap();
+        assert_eq!(btree.get(5).unwrap(), vec![b"val5".to_vec()]);
+        assert_eq!(btree.get(6).unwrap(), vec![b"val6".to_vec()]);
+        assert!(btree.get(7).is_err());
+    }
+
+    #[test]
+    fn crash_recovery_multi_level_tree_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        let t1 = btree.begin_transaction().unwrap();
+        for i in 1..=30u64 {
+            btree
+                .insert_with_txn(t1, i, vec![format!("v{}", i).into_bytes()])
+                .unwrap();
+        }
+        btree.commit_transaction(t1).unwrap();
+
+        let cp_lsn = btree.fuzzy_checkpoint().unwrap();
+        assert!(cp_lsn > 0);
+
+        let t2 = btree.begin_transaction().unwrap();
+        for i in 31..=60u64 {
+            btree
+                .insert_with_txn(t2, i, vec![format!("v{}", i).into_bytes()])
+                .unwrap();
+        }
+        btree.commit_transaction(t2).unwrap();
+
+        let t3 = btree.begin_transaction().unwrap();
+        for i in 61..=80u64 {
+            btree
+                .insert_with_txn(t3, i, vec![format!("v{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+
+        for i in 1..=60u64 {
+            assert_eq!(btree.get(i).unwrap(), vec![format!("v{}", i).into_bytes()]);
+        }
+        for i in 61..=80u64 {
+            assert!(btree.get(i).is_err());
+        }
+    }
+
+    #[test]
+    fn crash_recovery_reopen_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index_file.db");
+        let heap_path = dir.path().join("heap_file.db");
+
+        {
+            let mut btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
+            let t1 = btree.begin_transaction().unwrap();
+            btree
+                .insert_with_txn(t1, 100, vec![b"first_val".to_vec()])
+                .unwrap();
+            btree.commit_transaction(t1).unwrap();
+
+            btree.fuzzy_checkpoint().unwrap();
+
+            let t2 = btree.begin_transaction().unwrap();
+            btree
+                .insert_with_txn(t2, 200, vec![b"second_val".to_vec()])
+                .unwrap();
+            btree.commit_transaction(t2).unwrap();
+
+            let t3 = btree.begin_transaction().unwrap();
+            btree
+                .insert_with_txn(t3, 300, vec![b"third_val".to_vec()])
+                .unwrap();
+
+            btree.pager.wal.flush_all().unwrap();
+            let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+            for p in idx_dirty {
+                btree.pager.flush_index_page(p).unwrap();
+            }
+            for p in heap_dirty {
+                btree.pager.flush_heap_page(p).unwrap();
+            }
+        }
+
+        {
+            let mut btree = BplusTree::new(index_path, heap_path).unwrap();
+            btree.recover().unwrap();
+
+            assert_eq!(btree.get(100).unwrap(), vec![b"first_val".to_vec()]);
+            assert_eq!(btree.get(200).unwrap(), vec![b"second_val".to_vec()]);
+            assert!(btree.get(300).is_err());
+        }
     }
 }

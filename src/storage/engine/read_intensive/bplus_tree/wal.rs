@@ -28,17 +28,16 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use crate::storage::engine::read_intensive::bplus_tree::PageKind;
 use crate::storage::engine::read_intensive::bplus_tree::wal_buffer::WalBuffer;
 
-use super::{buffer_pool::BufferPool, header::WAL_HEADER_SIZE, header::WalHeader};
+use super::{header::WAL_HEADER_SIZE, header::WalHeader};
 
 pub const WAL_RECORD_HEADER_SIZE: usize = 8 + 4 + 8 + 1 + 1 + 8 + 4 + 2; // 36 bytes
 pub const WAL_POOL_CAPACITY: usize = 10_000;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordType {
+pub(crate) enum RecordType {
     Begin = 1, // the transaction begining
     Update = 2,
     Commit = 3,
@@ -142,7 +141,6 @@ pub struct UpdatePayload<'a> {
 
 impl<'a> UpdatePayload<'a> {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.offset_in_page.to_le_bytes());
         buf.extend_from_slice(&(self.undo_data.len() as u16).to_le_bytes());
         buf.extend_from_slice(self.undo_data);
         buf.extend_from_slice(&(self.redo_data.len() as u16).to_le_bytes());
@@ -593,13 +591,13 @@ impl Wal {
         Ok(records)
     }
 
-    pub fn read_records_from(&self, start_lsn: u64) -> Result<Vec<WalRecord>, Box<dyn Error>> {
-        let all = self.read_all_records()?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.header.lsn >= start_lsn)
-            .collect())
-    }
+    // pub fn read_records_from(&self, start_lsn: u64) -> Result<Vec<WalRecord>, Box<dyn Error>> {
+    //     let all = self.read_all_records()?;
+    //     Ok(all
+    //         .into_iter()
+    //         .filter(|r| r.header.lsn >= start_lsn)
+    //         .collect())
+    // }
 
     pub fn read_records_backward(&self) -> Result<Vec<WalRecord>, Box<dyn Error>> {
         let mut records = Vec::new();

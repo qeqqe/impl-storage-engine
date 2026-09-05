@@ -16,8 +16,6 @@
 //! NOTE: About, checkpointing method; i'm leaning towards having fuzzy
 //! checkpointing,
 
-use super::wal::WalRecordHeader;
-
 pub(crate) struct WalBuffer {
     pub(super) buffer: Vec<u8>,
     // when we have to flush till LSN x, we find the offset of LSN x by,
@@ -37,22 +35,6 @@ impl WalBuffer {
         }
     }
 
-    pub fn contains(&self, lsn: u64) -> bool {
-        let (Some(first), Some(last)) = (self.offsets.first(), self.offsets.last()) else {
-            return false;
-        };
-
-        (first.0..=last.0).contains(&lsn)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
     pub fn is_full(&self) -> bool {
         self.offsets.len() >= self.max_frames
     }
@@ -62,11 +44,25 @@ impl WalBuffer {
         self.offsets.push((lsn, rec_offset));
     }
 
-    pub fn first_lsn(&self) -> Option<u64> {
-        self.offsets.first().map(|&(lsn, _)| lsn)
-    }
-
-    pub fn last_lsn(&self) -> Option<u64> {
-        self.offsets.last().map(|&(lsn, _)| lsn)
-    }
+    // pub fn is_empty(&self) -> bool {
+    //     self.offsets.is_empty()
+    // }
+    // pub fn len(&self) -> usize {
+    //     self.offsets.len()
+    // }
+    // pub fn contains(&self, lsn: u64) -> bool {
+    //     let (Some(first), Some(last)) = (self.offsets.first(), self.offsets.last()) else {
+    //         return false;
+    //     };
+    //
+    //     (first.0..=last.0).contains(&lsn)
+    // }
+    //
+    // pub fn first_lsn(&self) -> Option<u64> {
+    //     self.offsets.first().map(|&(lsn, _)| lsn)
+    // }
+    //
+    // pub fn last_lsn(&self) -> Option<u64> {
+    //     self.offsets.last().map(|&(lsn, _)| lsn)
+    // }
 }

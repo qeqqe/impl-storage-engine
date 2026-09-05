@@ -1,5 +1,3 @@
-use crate::storage::engine::read_intensive::bplus_tree::slotted_page::HeapPage;
-
 pub(crate) const HEAP_HEADER_SIZE: usize = 21;
 pub(crate) const WAL_HEADER_SIZE: usize = 28;
 

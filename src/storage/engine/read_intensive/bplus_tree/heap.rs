@@ -50,7 +50,7 @@ impl Heap {
     ) -> Result<(), Box<dyn Error>> {
         let page = self.fetch(id)?;
         let header =
-            HeapHeader::deserialize(&page.data).ok_or("Couldn't deserialize the header")?;
+            HeapHeader::deserialize(&page.data).ok_or("Couldn't deserialize the heap header")?;
 
         let cell_ptrs = Self::get_cell_ptr(&page.data, &header);
         for cell_ptr in &cell_ptrs {

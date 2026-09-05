@@ -1,4 +1,4 @@
-use std::{error::Error, ops::Range};
+use std::error::Error;
 
 use super::{
     HEADER_SIZE, KEY_SIZE, PAGE_SIZE, PTR_SIZE, SLOT_SIZE,
@@ -127,7 +127,7 @@ impl Page {
 
     pub fn header(&self) -> Result<IndexHeader, Box<dyn Error>> {
         IndexHeader::deserialize(&self.data[..HEADER_SIZE])
-            .ok_or("Couldn't deserialize the header".into())
+            .ok_or("Couldn't deserialize the index header".into())
     }
 
     pub fn num_cells(&self) -> Result<usize, Box<dyn Error>> {
