@@ -224,7 +224,6 @@ pub(super) struct Wal {
     pub header: WalHeader,
     pub flushed_lsn: u64,
     pub active_txns: HashMap<u64, u64>,
-    pub next_txn_id: u64,
 }
 
 impl Wal {
@@ -267,53 +266,7 @@ impl Wal {
             header.next_lsn - 1
         };
 
-        let mut active_txns = HashMap::new();
-        let mut next_txn_id = 1;
-
-        // The code below might seem idiomatic to find the last transaction id
-        // (i did too) but it isn't, because of the concurrent transaction it's
-        // NEVER gauranteed that the latest WAL log record will be the latest
-        // transaction id.
-        //
-        // I also thought about traversing from the back but we face the same
-        // issue as we can never tell even from the back that this is the latest
-        // transaction id.
-        //
-        // if existing_len >= WAL_HEADER_SIZE as u64 {
-        //     let last_wal_offset = header.last_wal_offset;
-        //     let mut header_buf = [0u8; WAL_RECORD_HEADER_SIZE];
-        //     log_file.read_exact_at(&mut header_buf, last_wal_offset)?;
-        //     h = WalRecordHeader::deserialize(&header_buf).unwrap();
-        //     next_txn_id = h.txn_id + 1;
-        // }
-
-        if existing_len >= WAL_HEADER_SIZE as u64 {
-            let mut offset = WAL_HEADER_SIZE as u64;
-            while offset + WAL_RECORD_HEADER_SIZE as u64 <= existing_len {
-                let mut header_buf = [0u8; WAL_RECORD_HEADER_SIZE];
-                if log_file.read_exact_at(&mut header_buf, offset).is_err() {
-                    break;
-                }
-                if let Some(h) = WalRecordHeader::deserialize(&header_buf) {
-                    if h.txn_id >= next_txn_id {
-                        next_txn_id = h.txn_id + 1;
-                    }
-                    if h.record_type == RecordType::Begin {
-                        active_txns.insert(h.txn_id, h.lsn);
-                    } else if h.record_type == RecordType::Commit
-                        || h.record_type == RecordType::Abort
-                    {
-                        active_txns.remove(&h.txn_id);
-                    } else if h.txn_id != 0 {
-                        active_txns.insert(h.txn_id, h.lsn);
-                    }
-                    offset += WAL_RECORD_HEADER_SIZE as u64 + h.payload_len as u64;
-                } else {
-                    break;
-                }
-            }
-        }
-
+        let active_txns = HashMap::new();
         let wal_buffer = WalBuffer::new(WAL_POOL_CAPACITY);
 
         Ok(Self {
@@ -323,7 +276,6 @@ impl Wal {
             header,
             flushed_lsn,
             active_txns,
-            next_txn_id,
         })
     }
 
@@ -401,9 +353,7 @@ impl Wal {
         Ok(lsn)
     }
 
-    pub fn begin_transaction(&mut self) -> Result<u64, Box<dyn Error>> {
-        let txn_id = self.next_txn_id;
-        self.next_txn_id += 1;
+    pub fn begin_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
         let lsn = self.write_raw_record(txn_id, RecordType::Begin, 0, false, 0, &[])?;
         self.active_txns.insert(txn_id, lsn);
         Ok(txn_id)

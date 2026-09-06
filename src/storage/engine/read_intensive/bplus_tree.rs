@@ -74,8 +74,8 @@ impl BplusTree {
         Ok(Self { root_id, pager })
     }
 
-    pub fn begin_transaction(&mut self) -> Result<u64, Box<dyn Error>> {
-        self.pager.wal.begin_transaction()
+    pub fn begin_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        self.pager.wal.begin_transaction(txn_id)
     }
 
     pub fn commit_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
@@ -106,7 +106,8 @@ impl BplusTree {
     /// Traverses the tree, finds the cell content in page
     /// i.e. the offset & size of the actual data in the heap file
     /// returns a &Vec<u8> of the data, the callers can transmute it.
-    pub fn get(&mut self, key: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    pub fn get(&mut self, txn_id: u64, key: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let _ = txn_id;
         let mut page_id = self.root_id;
         loop {
             let (cells, p_hdr) = {
@@ -158,11 +159,7 @@ impl BplusTree {
     // TODO: update the data records to contain more metadata about the
     // inserted item for a better labled addressing of the data memebers,
     // updates can mess up things if we're not careful withi it.
-    pub fn insert(&mut self, key: u64, data_records: Vec<Vec<u8>>) -> Result<(), Box<dyn Error>> {
-        self.insert_with_txn(0, key, data_records)
-    }
-
-    pub fn insert_with_txn(
+    pub fn insert(
         &mut self,
         txn_id: u64,
         key: u64,
@@ -214,6 +211,15 @@ impl BplusTree {
         }
 
         Ok(())
+    }
+
+    pub fn insert_with_txn(
+        &mut self,
+        txn_id: u64,
+        key: u64,
+        data_records: Vec<Vec<u8>>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.insert(txn_id, key, data_records)
     }
 
     fn handle_overfull(
@@ -420,11 +426,7 @@ impl BplusTree {
         }
     }
 
-    pub fn delete(&mut self, key: u64) -> Result<(), Box<dyn Error>> {
-        self.delete_with_txn(0, key)
-    }
-
-    pub fn delete_with_txn(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
+    pub fn delete(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
         let crumbs = self.breadcrumbs(key)?;
 
         if !crumbs.found {
@@ -465,6 +467,10 @@ impl BplusTree {
         self.handle_underfull(txn_id, leaf_id, &mut trail)?;
 
         Ok(())
+    }
+
+    pub fn delete_with_txn(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
+        self.delete(txn_id, key)
     }
 
     fn propagate_key_update(
@@ -1303,8 +1309,6 @@ struct Sibling {
 
 #[cfg(test)]
 mod test {
-    use std::fs;
-
     use super::*;
     use wal::RecordType;
 
@@ -1319,9 +1323,9 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"hello".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"hello".to_vec()]).unwrap();
 
-        let result = btree.get(1u64).unwrap();
+        let result = btree.get(0, 1u64).unwrap();
         assert_eq!(result, vec![b"hello".to_vec()]);
     }
 
@@ -1330,15 +1334,15 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(5u64, vec![b"five".to_vec()]).unwrap();
-        btree.insert(3u64, vec![b"three".to_vec()]).unwrap();
-        btree.insert(7u64, vec![b"seven".to_vec()]).unwrap();
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(0, 5u64, vec![b"five".to_vec()]).unwrap();
+        btree.insert(0, 3u64, vec![b"three".to_vec()]).unwrap();
+        btree.insert(0, 7u64, vec![b"seven".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
 
-        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
-        assert_eq!(btree.get(3u64).unwrap(), vec![b"three".to_vec()]);
-        assert_eq!(btree.get(5u64).unwrap(), vec![b"five".to_vec()]);
-        assert_eq!(btree.get(7u64).unwrap(), vec![b"seven".to_vec()]);
+        assert_eq!(btree.get(0, 1u64).unwrap(), vec![b"one".to_vec()]);
+        assert_eq!(btree.get(0, 3u64).unwrap(), vec![b"three".to_vec()]);
+        assert_eq!(btree.get(0, 5u64).unwrap(), vec![b"five".to_vec()]);
+        assert_eq!(btree.get(0, 7u64).unwrap(), vec![b"seven".to_vec()]);
     }
 
     #[test]
@@ -1346,9 +1350,9 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
 
-        let result = btree.get(999u64);
+        let result = btree.get(0, 999u64);
         assert!(result.is_err());
     }
 
@@ -1357,8 +1361,8 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
-        let result = btree.insert(1u64, vec![b"one again".to_vec()]);
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
+        let result = btree.insert(0, 1u64, vec![b"one again".to_vec()]);
         assert!(result.is_err());
     }
 
@@ -1368,9 +1372,9 @@ mod test {
         let mut btree = get_btree_in(dir.path());
 
         let records = vec![b"field1".to_vec(), b"field2".to_vec(), b"field3".to_vec()];
-        btree.insert(42u64, records.clone()).unwrap();
+        btree.insert(0, 42u64, records.clone()).unwrap();
 
-        let result = btree.get(42u64).unwrap();
+        let result = btree.get(0, 42u64).unwrap();
         assert_eq!(result, records);
     }
 
@@ -1379,15 +1383,15 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
-        btree.insert(2u64, vec![b"two".to_vec()]).unwrap();
-        btree.insert(3u64, vec![b"three".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(0, 2u64, vec![b"two".to_vec()]).unwrap();
+        btree.insert(0, 3u64, vec![b"three".to_vec()]).unwrap();
 
-        btree.delete(2u64).unwrap();
+        btree.delete(0, 2u64).unwrap();
 
-        assert!(btree.get(2u64).is_err());
-        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
-        assert_eq!(btree.get(3u64).unwrap(), vec![b"three".to_vec()]);
+        assert!(btree.get(0, 2u64).is_err());
+        assert_eq!(btree.get(0, 1u64).unwrap(), vec![b"one".to_vec()]);
+        assert_eq!(btree.get(0, 3u64).unwrap(), vec![b"three".to_vec()]);
     }
 
     #[test]
@@ -1395,8 +1399,8 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
-        let result = btree.delete(999u64);
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
+        let result = btree.delete(0, 999u64);
         assert!(result.is_err());
     }
 
@@ -1405,14 +1409,14 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
-        btree.insert(2u64, vec![b"two".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(0, 2u64, vec![b"two".to_vec()]).unwrap();
 
-        btree.delete(1u64).unwrap();
-        btree.delete(2u64).unwrap();
+        btree.delete(0, 1u64).unwrap();
+        btree.delete(0, 2u64).unwrap();
 
-        assert!(btree.get(1u64).is_err());
-        assert!(btree.get(2u64).is_err());
+        assert!(btree.get(0, 1u64).is_err());
+        assert!(btree.get(0, 2u64).is_err());
     }
 
     #[test]
@@ -1422,12 +1426,12 @@ mod test {
 
         for i in 1..=20u64 {
             btree
-                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("val-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 1..=20u64 {
-            let result = btree.get(i).unwrap();
+            let result = btree.get(0, i).unwrap();
             assert_eq!(result, vec![format!("val-{}", i).into_bytes()]);
         }
     }
@@ -1439,12 +1443,12 @@ mod test {
 
         for i in (1..=20u64).rev() {
             btree
-                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("val-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 1..=20u64 {
-            let result = btree.get(i).unwrap();
+            let result = btree.get(0, i).unwrap();
             assert_eq!(result, vec![format!("val-{}", i).into_bytes()]);
         }
     }
@@ -1457,12 +1461,12 @@ mod test {
         let count = ORDER as u64 * 4;
         for i in 1..=count {
             btree
-                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("data-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 1..=count {
-            let result = btree.get(i).unwrap();
+            let result = btree.get(0, i).unwrap();
             assert_eq!(
                 result,
                 vec![format!("data-{}", i).into_bytes()],
@@ -1471,8 +1475,8 @@ mod test {
             );
         }
 
-        assert!(btree.get(0).is_err());
-        assert!(btree.get(count + 1).is_err());
+        assert!(btree.get(0, 0).is_err());
+        assert!(btree.get(0, count + 1).is_err());
     }
 
     #[test]
@@ -1483,18 +1487,18 @@ mod test {
         let count = ORDER as u64 * 3;
         for i in (1..=count).step_by(2) {
             btree
-                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("val-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in (1..=count).step_by(2) {
-            let result = btree.get(i);
+            let result = btree.get(0, i);
             assert!(result.is_ok(), "Key {} should exist", i);
             assert_eq!(result.unwrap(), vec![format!("val-{}", i).into_bytes()]);
         }
 
         for i in (2..=count).step_by(2) {
-            let result = btree.get(i);
+            let result = btree.get(0, i);
             assert!(result.is_err(), "Key {} should not exist", i);
         }
     }
@@ -1507,21 +1511,21 @@ mod test {
         let count = ORDER as u64 * 3;
         for i in 1..=count {
             btree
-                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("data-{}", i).into_bytes()])
                 .unwrap();
         }
 
         // delete odd keys to trigger leaf/internal redistributions and merges
         for i in (1..=count).step_by(2) {
-            btree.delete(i).unwrap();
+            btree.delete(0, i).unwrap();
         }
 
         // check odd keys are gone and even keys remain
         for i in 1..=count {
             if i % 2 == 1 {
-                assert!(btree.get(i).is_err(), "Key {} should be deleted", i);
+                assert!(btree.get(0, i).is_err(), "Key {} should be deleted", i);
             } else {
-                let result = btree.get(i);
+                let result = btree.get(0, i);
                 assert!(result.is_ok(), "Key {} should still exist", i);
                 assert_eq!(result.unwrap(), vec![format!("data-{}", i).into_bytes()]);
             }
@@ -1530,12 +1534,12 @@ mod test {
         // reinsert deleted keys and check
         for i in (1..=count).step_by(2) {
             btree
-                .insert(i, vec![format!("re-data-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("re-data-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 1..=count {
-            let result = btree.get(i).unwrap();
+            let result = btree.get(0, i).unwrap();
             if i % 2 == 1 {
                 assert_eq!(result, vec![format!("re-data-{}", i).into_bytes()]);
             } else {
@@ -1552,23 +1556,23 @@ mod test {
         let count = ORDER as u64 * 2;
         for i in 1..=count {
             btree
-                .insert(i, vec![format!("v-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("v-{}", i).into_bytes()])
                 .unwrap();
         }
 
         // delete almost all keys except a few, triggering multiple merges and root collapse
         for i in 4..=count {
-            btree.delete(i).unwrap();
+            btree.delete(0, i).unwrap();
         }
 
-        assert_eq!(btree.get(1).unwrap(), vec![b"v-1".to_vec()]);
-        assert_eq!(btree.get(2).unwrap(), vec![b"v-2".to_vec()]);
-        assert_eq!(btree.get(3).unwrap(), vec![b"v-3".to_vec()]);
-        assert!(btree.get(4).is_err());
+        assert_eq!(btree.get(0, 1).unwrap(), vec![b"v-1".to_vec()]);
+        assert_eq!(btree.get(0, 2).unwrap(), vec![b"v-2".to_vec()]);
+        assert_eq!(btree.get(0, 3).unwrap(), vec![b"v-3".to_vec()]);
+        assert!(btree.get(0, 4).is_err());
 
         // insert new keys into the collapsed root
-        btree.insert(100, vec![b"v-100".to_vec()]).unwrap();
-        assert_eq!(btree.get(100).unwrap(), vec![b"v-100".to_vec()]);
+        btree.insert(0, 100, vec![b"v-100".to_vec()]).unwrap();
+        assert_eq!(btree.get(0, 100).unwrap(), vec![b"v-100".to_vec()]);
     }
 
     #[test]
@@ -1579,20 +1583,20 @@ mod test {
         let count = 300u64;
         for i in 1..=count {
             btree
-                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("val-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 100..=200 {
-            btree.delete(i).unwrap();
+            btree.delete(0, i).unwrap();
         }
 
         for i in 1..=count {
             if (100..=200).contains(&i) {
-                assert!(btree.get(i).is_err(), "Key {} should be deleted", i);
+                assert!(btree.get(0, i).is_err(), "Key {} should be deleted", i);
             } else {
                 assert_eq!(
-                    btree.get(i).unwrap(),
+                    btree.get(0, i).unwrap(),
                     vec![format!("val-{}", i).into_bytes()]
                 );
             }
@@ -1600,13 +1604,13 @@ mod test {
 
         for i in 500..=600 {
             btree
-                .insert(i, vec![format!("val-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("val-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 500..=600 {
             assert_eq!(
-                btree.get(i).unwrap(),
+                btree.get(0, i).unwrap(),
                 vec![format!("val-{}", i).into_bytes()]
             );
         }
@@ -1620,23 +1624,23 @@ mod test {
         let count = ORDER as u64 * 2;
         for i in 1..=count {
             btree
-                .insert(i, vec![format!("data-{}", i).into_bytes()])
+                .insert(0, i, vec![format!("data-{}", i).into_bytes()])
                 .unwrap();
         }
 
         for i in 1..=count {
-            btree.delete(i).unwrap();
-            assert!(btree.get(i).is_err());
+            btree.delete(0, i).unwrap();
+            assert!(btree.get(0, i).is_err());
         }
 
         // tree is empty... getting any key should return error
         for i in 1..=count {
-            assert!(btree.get(i).is_err());
+            assert!(btree.get(0, i).is_err());
         }
 
         // can insert again into empty root
-        btree.insert(42, vec![b"forty-two".to_vec()]).unwrap();
-        assert_eq!(btree.get(42).unwrap(), vec![b"forty-two".to_vec()]);
+        btree.insert(0, 42, vec![b"forty-two".to_vec()]).unwrap();
+        assert_eq!(btree.get(0, 42).unwrap(), vec![b"forty-two".to_vec()]);
     }
 
     #[test]
@@ -1644,11 +1648,11 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1u64, vec![b"first".to_vec()]).unwrap();
-        btree.delete(1u64).unwrap();
-        btree.insert(1u64, vec![b"second".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"first".to_vec()]).unwrap();
+        btree.delete(0, 1u64).unwrap();
+        btree.insert(0, 1u64, vec![b"second".to_vec()]).unwrap();
 
-        assert_eq!(btree.get(1u64).unwrap(), vec![b"second".to_vec()]);
+        assert_eq!(btree.get(0, 1u64).unwrap(), vec![b"second".to_vec()]);
     }
 
     #[test]
@@ -1656,7 +1660,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        assert!(btree.get(1u64).is_err());
+        assert!(btree.get(0, 1u64).is_err());
     }
 
     #[test]
@@ -1665,9 +1669,9 @@ mod test {
         let mut btree = get_btree_in(dir.path());
 
         let big_data = vec![0xABu8; 4000];
-        btree.insert(1u64, vec![big_data.clone()]).unwrap();
+        btree.insert(0, 1u64, vec![big_data.clone()]).unwrap();
 
-        let result = btree.get(1u64).unwrap();
+        let result = btree.get(0, 1u64).unwrap();
         assert_eq!(result, vec![big_data]);
     }
 
@@ -1678,9 +1682,9 @@ mod test {
 
         for i in 1..=10u64 {
             btree
-                .insert(i, vec![format!("v{}", i).into_bytes()])
+                .insert(0, i, vec![format!("v{}", i).into_bytes()])
                 .unwrap();
-            let result = btree.get(i).unwrap();
+            let result = btree.get(0, i).unwrap();
             assert_eq!(result, vec![format!("v{}", i).into_bytes()]);
         }
     }
@@ -1690,13 +1694,13 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(0u64, vec![b"zero".to_vec()]).unwrap();
-        btree.insert(u64::MAX, vec![b"max".to_vec()]).unwrap();
-        btree.insert(1u64, vec![b"one".to_vec()]).unwrap();
+        btree.insert(0, 0u64, vec![b"zero".to_vec()]).unwrap();
+        btree.insert(0, u64::MAX, vec![b"max".to_vec()]).unwrap();
+        btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
 
-        assert_eq!(btree.get(0u64).unwrap(), vec![b"zero".to_vec()]);
-        assert_eq!(btree.get(u64::MAX).unwrap(), vec![b"max".to_vec()]);
-        assert_eq!(btree.get(1u64).unwrap(), vec![b"one".to_vec()]);
+        assert_eq!(btree.get(0, 0u64).unwrap(), vec![b"zero".to_vec()]);
+        assert_eq!(btree.get(0, u64::MAX).unwrap(), vec![b"max".to_vec()]);
+        assert_eq!(btree.get(0, 1u64).unwrap(), vec![b"one".to_vec()]);
     }
 
     #[test]
@@ -1709,20 +1713,20 @@ mod test {
             let mut btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
             for i in 1..=50u64 {
                 btree
-                    .insert(i, vec![format!("value-{}", i).into_bytes()])
+                    .insert(0, i, vec![format!("value-{}", i).into_bytes()])
                     .unwrap();
             }
             btree.pager.flush_all().unwrap();
         }
 
         {
-            let mut reopened = Pager::new(index_path, heap_path).unwrap();
+            let reopened = Pager::new(index_path, heap_path).unwrap();
             let mut btree = BplusTree {
                 root_id: 0,
                 pager: reopened,
             };
             for i in 1..=50u64 {
-                let res = btree.get(i).unwrap();
+                let res = btree.get(0, i).unwrap();
                 assert_eq!(res, vec![format!("value-{}", i).into_bytes()]);
             }
         }
@@ -1733,14 +1737,16 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        btree.insert(1, vec![b"first".to_vec()]).unwrap();
+        btree.insert(0, 1, vec![b"first".to_vec()]).unwrap();
         btree.pager.flush_all().unwrap();
 
-        btree.insert(2, vec![b"uncommitted shit".to_vec()]).unwrap();
+        btree
+            .insert(0, 2, vec![b"uncommitted shit".to_vec()])
+            .unwrap();
         btree.pager.discard_all_dirty();
 
         // 1 was flushed... so refetching from disk should wokr..
-        assert_eq!(btree.get(1).unwrap(), vec![b"first".to_vec()]);
+        assert_eq!(btree.get(0, 1).unwrap(), vec![b"first".to_vec()]);
     }
 
     #[test]
@@ -1748,18 +1754,14 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        assert_eq!(t1, 1);
-        btree
-            .insert_with_txn(t1, 1, vec![b"val1".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 1, vec![b"val1".to_vec()]).unwrap();
         btree.commit_transaction(t1).unwrap();
 
-        let t2 = btree.begin_transaction().unwrap();
-        assert_eq!(t2, 2);
-        btree
-            .insert_with_txn(t2, 2, vec![b"val2".to_vec()])
-            .unwrap();
+        let t2 = 2;
+        btree.begin_transaction(t2).unwrap();
+        btree.insert(t2, 2, vec![b"val2".to_vec()]).unwrap();
         btree.abort_transaction(t2).unwrap();
 
         let records = btree.pager.wal.read_all_records().unwrap();
@@ -1781,10 +1783,9 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1, 42, vec![b"val42".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 42, vec![b"val42".to_vec()]).unwrap();
 
         let (idx_dirty, _) = btree.pager.dirty_pages();
         assert!(!idx_dirty.is_empty());
@@ -1802,15 +1803,13 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1, 100, vec![b"hello".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 100, vec![b"hello".to_vec()]).unwrap();
 
-        let t2 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t2, 200, vec![b"world".to_vec()])
-            .unwrap();
+        let t2 = 2;
+        btree.begin_transaction(t2).unwrap();
+        btree.insert(t2, 200, vec![b"world".to_vec()]).unwrap();
 
         let cp_lsn = btree.fuzzy_checkpoint().unwrap();
         assert!(cp_lsn > 0);
@@ -1838,25 +1837,22 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1, 10, vec![b"val10".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 10, vec![b"val10".to_vec()]).unwrap();
         btree.commit_transaction(t1).unwrap();
 
         let cp_lsn = btree.fuzzy_checkpoint().unwrap();
         assert!(cp_lsn > 0);
 
-        let t2 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t2, 20, vec![b"val20".to_vec()])
-            .unwrap();
+        let t2 = 2;
+        btree.begin_transaction(t2).unwrap();
+        btree.insert(t2, 20, vec![b"val20".to_vec()]).unwrap();
         btree.commit_transaction(t2).unwrap();
 
-        let t3 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t3, 30, vec![b"val30".to_vec()])
-            .unwrap();
+        let t3 = 3;
+        btree.begin_transaction(t3).unwrap();
+        btree.insert(t3, 30, vec![b"val30".to_vec()]).unwrap();
 
         btree.pager.wal.flush_all().unwrap();
         let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
@@ -1871,9 +1867,9 @@ mod test {
 
         btree.recover().unwrap();
 
-        assert_eq!(btree.get(10).unwrap(), vec![b"val10".to_vec()]);
-        assert_eq!(btree.get(20).unwrap(), vec![b"val20".to_vec()]);
-        assert!(btree.get(30).is_err());
+        assert_eq!(btree.get(0, 10).unwrap(), vec![b"val10".to_vec()]);
+        assert_eq!(btree.get(0, 20).unwrap(), vec![b"val20".to_vec()]);
+        assert!(btree.get(0, 30).is_err());
     }
 
     #[test]
@@ -1881,22 +1877,21 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1, 10, vec![b"val10".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 10, vec![b"val10".to_vec()]).unwrap();
         btree.commit_transaction(t1).unwrap();
 
-        let t1b = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1b, 20, vec![b"val20".to_vec()])
-            .unwrap();
+        let t1b = 2;
+        btree.begin_transaction(t1b).unwrap();
+        btree.insert(t1b, 20, vec![b"val20".to_vec()]).unwrap();
         btree.commit_transaction(t1b).unwrap();
 
         btree.fuzzy_checkpoint().unwrap();
 
-        let t2 = btree.begin_transaction().unwrap();
-        btree.delete_with_txn(t2, 10).unwrap();
+        let t2 = 3;
+        btree.begin_transaction(t2).unwrap();
+        btree.delete(t2, 10).unwrap();
 
         btree.pager.wal.flush_all().unwrap();
         let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
@@ -1911,8 +1906,8 @@ mod test {
 
         btree.recover().unwrap();
 
-        assert_eq!(btree.get(10).unwrap(), vec![b"val10".to_vec()]);
-        assert_eq!(btree.get(20).unwrap(), vec![b"val20".to_vec()]);
+        assert_eq!(btree.get(0, 10).unwrap(), vec![b"val10".to_vec()]);
+        assert_eq!(btree.get(0, 20).unwrap(), vec![b"val20".to_vec()]);
     }
 
     #[test]
@@ -1920,24 +1915,21 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t1, 5, vec![b"val5".to_vec()])
-            .unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
+        btree.insert(t1, 5, vec![b"val5".to_vec()]).unwrap();
         btree.commit_transaction(t1).unwrap();
 
         btree.fuzzy_checkpoint().unwrap();
 
-        let t2 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t2, 6, vec![b"val6".to_vec()])
-            .unwrap();
+        let t2 = 2;
+        btree.begin_transaction(t2).unwrap();
+        btree.insert(t2, 6, vec![b"val6".to_vec()]).unwrap();
         btree.commit_transaction(t2).unwrap();
 
-        let t3 = btree.begin_transaction().unwrap();
-        btree
-            .insert_with_txn(t3, 7, vec![b"val7".to_vec()])
-            .unwrap();
+        let t3 = 3;
+        btree.begin_transaction(t3).unwrap();
+        btree.insert(t3, 7, vec![b"val7".to_vec()]).unwrap();
 
         btree.pager.wal.flush_all().unwrap();
         let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
@@ -1951,14 +1943,14 @@ mod test {
         btree.pager.discard_all_dirty();
 
         btree.recover().unwrap();
-        assert_eq!(btree.get(5).unwrap(), vec![b"val5".to_vec()]);
-        assert_eq!(btree.get(6).unwrap(), vec![b"val6".to_vec()]);
-        assert!(btree.get(7).is_err());
+        assert_eq!(btree.get(0, 5).unwrap(), vec![b"val5".to_vec()]);
+        assert_eq!(btree.get(0, 6).unwrap(), vec![b"val6".to_vec()]);
+        assert!(btree.get(0, 7).is_err());
 
         btree.recover().unwrap();
-        assert_eq!(btree.get(5).unwrap(), vec![b"val5".to_vec()]);
-        assert_eq!(btree.get(6).unwrap(), vec![b"val6".to_vec()]);
-        assert!(btree.get(7).is_err());
+        assert_eq!(btree.get(0, 5).unwrap(), vec![b"val5".to_vec()]);
+        assert_eq!(btree.get(0, 6).unwrap(), vec![b"val6".to_vec()]);
+        assert!(btree.get(0, 7).is_err());
     }
 
     #[test]
@@ -1966,10 +1958,11 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let mut btree = get_btree_in(dir.path());
 
-        let t1 = btree.begin_transaction().unwrap();
+        let t1 = 1;
+        btree.begin_transaction(t1).unwrap();
         for i in 1..=30u64 {
             btree
-                .insert_with_txn(t1, i, vec![format!("v{}", i).into_bytes()])
+                .insert(t1, i, vec![format!("v{}", i).into_bytes()])
                 .unwrap();
         }
         btree.commit_transaction(t1).unwrap();
@@ -1977,18 +1970,20 @@ mod test {
         let cp_lsn = btree.fuzzy_checkpoint().unwrap();
         assert!(cp_lsn > 0);
 
-        let t2 = btree.begin_transaction().unwrap();
+        let t2 = 2;
+        btree.begin_transaction(t2).unwrap();
         for i in 31..=60u64 {
             btree
-                .insert_with_txn(t2, i, vec![format!("v{}", i).into_bytes()])
+                .insert(t2, i, vec![format!("v{}", i).into_bytes()])
                 .unwrap();
         }
         btree.commit_transaction(t2).unwrap();
 
-        let t3 = btree.begin_transaction().unwrap();
+        let t3 = 3;
+        btree.begin_transaction(t3).unwrap();
         for i in 61..=80u64 {
             btree
-                .insert_with_txn(t3, i, vec![format!("v{}", i).into_bytes()])
+                .insert(t3, i, vec![format!("v{}", i).into_bytes()])
                 .unwrap();
         }
 
@@ -2006,10 +2001,13 @@ mod test {
         btree.recover().unwrap();
 
         for i in 1..=60u64 {
-            assert_eq!(btree.get(i).unwrap(), vec![format!("v{}", i).into_bytes()]);
+            assert_eq!(
+                btree.get(0, i).unwrap(),
+                vec![format!("v{}", i).into_bytes()]
+            );
         }
         for i in 61..=80u64 {
-            assert!(btree.get(i).is_err());
+            assert!(btree.get(0, i).is_err());
         }
     }
 
@@ -2021,24 +2019,21 @@ mod test {
 
         {
             let mut btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
-            let t1 = btree.begin_transaction().unwrap();
-            btree
-                .insert_with_txn(t1, 100, vec![b"first_val".to_vec()])
-                .unwrap();
+            let t1 = 1;
+            btree.begin_transaction(t1).unwrap();
+            btree.insert(t1, 100, vec![b"first_val".to_vec()]).unwrap();
             btree.commit_transaction(t1).unwrap();
 
             btree.fuzzy_checkpoint().unwrap();
 
-            let t2 = btree.begin_transaction().unwrap();
-            btree
-                .insert_with_txn(t2, 200, vec![b"second_val".to_vec()])
-                .unwrap();
+            let t2 = 2;
+            btree.begin_transaction(t2).unwrap();
+            btree.insert(t2, 200, vec![b"second_val".to_vec()]).unwrap();
             btree.commit_transaction(t2).unwrap();
 
-            let t3 = btree.begin_transaction().unwrap();
-            btree
-                .insert_with_txn(t3, 300, vec![b"third_val".to_vec()])
-                .unwrap();
+            let t3 = 3;
+            btree.begin_transaction(t3).unwrap();
+            btree.insert(t3, 300, vec![b"third_val".to_vec()]).unwrap();
 
             btree.pager.wal.flush_all().unwrap();
             let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
@@ -2054,9 +2049,66 @@ mod test {
             let mut btree = BplusTree::new(index_path, heap_path).unwrap();
             btree.recover().unwrap();
 
-            assert_eq!(btree.get(100).unwrap(), vec![b"first_val".to_vec()]);
-            assert_eq!(btree.get(200).unwrap(), vec![b"second_val".to_vec()]);
-            assert!(btree.get(300).is_err());
+            assert_eq!(btree.get(0, 100).unwrap(), vec![b"first_val".to_vec()]);
+            assert_eq!(btree.get(0, 200).unwrap(), vec![b"second_val".to_vec()]);
+            assert!(btree.get(0, 300).is_err());
         }
+    }
+
+    #[test]
+    fn caller_provided_transaction_id_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut btree = get_btree_in(dir.path());
+
+        btree.insert(0, 10, vec![b"autocommit".to_vec()]).unwrap();
+        assert_eq!(btree.get(0, 10).unwrap(), vec![b"autocommit".to_vec()]);
+
+        let txn_user = 1001u64;
+        let txn_order = 2002u64;
+
+        btree.begin_transaction(txn_user).unwrap();
+        btree
+            .insert(txn_user, 20, vec![b"user_data".to_vec()])
+            .unwrap();
+        assert_eq!(
+            btree.get(txn_user, 20).unwrap(),
+            vec![b"user_data".to_vec()]
+        );
+
+        btree.begin_transaction(txn_order).unwrap();
+        btree
+            .insert(txn_order, 30, vec![b"order_data".to_vec()])
+            .unwrap();
+        assert_eq!(
+            btree.get(txn_order, 30).unwrap(),
+            vec![b"order_data".to_vec()]
+        );
+
+        let cp_lsn = btree.fuzzy_checkpoint().unwrap();
+        assert!(cp_lsn > 0);
+
+        let records = btree.pager.wal.read_all_records().unwrap();
+        let cp_rec = records.iter().find(|r| r.header.lsn == cp_lsn).unwrap();
+        let cp_data = cp_rec.parse_checkpoint().unwrap();
+        assert!(cp_data.att.iter().any(|a| a.txn_id == txn_user));
+        assert!(cp_data.att.iter().any(|a| a.txn_id == txn_order));
+
+        btree.commit_transaction(txn_user).unwrap();
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+
+        assert_eq!(btree.get(0, 10).unwrap(), vec![b"autocommit".to_vec()]);
+        assert_eq!(btree.get(0, 20).unwrap(), vec![b"user_data".to_vec()]);
+        assert!(btree.get(0, 30).is_err());
     }
 }
