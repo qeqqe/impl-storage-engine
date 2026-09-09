@@ -5,6 +5,7 @@ use super::{
     header::{HeapHeader, IndexHeader, PageKind},
 };
 
+#[derive(Clone, Copy)]
 pub(super) struct Page {
     pub data: [u8; PAGE_SIZE],
 }
