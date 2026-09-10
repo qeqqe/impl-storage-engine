@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{error::Error, path::PathBuf};
 
 use header::PageKind;
@@ -33,8 +35,9 @@ const FANOUT: usize = ORDER + 1;
 const DEGREE: usize = FANOUT / 2;
 
 pub struct BplusTree {
-    root_id: u64,
+    root_id: AtomicU64,
     pager: Pager,
+    tree_lock: RwLock<()>,
 }
 
 impl BplusTree {
@@ -48,10 +51,11 @@ impl BplusTree {
         heap_path: PathBuf,
         wal_path: PathBuf,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut pager = Pager::new_with_wal(index_path, heap_path, wal_path)?;
-        let root_id = if pager.index.next_id > 0 {
+        let pager = Pager::new_with_wal(index_path, heap_path, wal_path)?;
+        let next_id = pager.index.next_id.load(Ordering::SeqCst);
+        let root_id = if next_id > 0 {
             let mut found_root = 0;
-            for id in 0..pager.index.next_id {
+            for id in 0..next_id {
                 if let Ok(hdr) = pager.index.fetch(id).header()
                     && hdr.page_ty == PageKind::Root
                 {
@@ -62,41 +66,49 @@ impl BplusTree {
             found_root
         } else {
             let id = pager.index.allocate(PageKind::Root);
-            let root_page = pager.index.fetch_mut(id);
+            let mut root_page = pager.index.fetch_mut(id);
             let mut hdr = root_page.header()?;
             hdr.set_root_leaf();
             hdr.serialize(&mut root_page.data[..HEADER_SIZE]);
             let new_data = root_page.data;
+            drop(root_page);
             pager.log_index_diff(0, id, &[0u8; PAGE_SIZE], &new_data)?;
             id
         };
 
-        Ok(Self { root_id, pager })
+        Ok(Self {
+            root_id: AtomicU64::new(root_id),
+            pager,
+            tree_lock: RwLock::new(()),
+        })
     }
 
-    pub fn begin_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+    pub fn begin_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
         self.pager.wal.begin_transaction(txn_id)
     }
 
-    pub fn commit_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+    pub fn commit_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
         self.pager.wal.commit_transaction(txn_id)
     }
 
-    pub fn abort_transaction(&mut self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+    pub fn abort_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
         self.pager.wal.abort_transaction(txn_id)
     }
 
-    pub fn fuzzy_checkpoint(&mut self) -> Result<u64, Box<dyn Error>> {
+    pub fn fuzzy_checkpoint(&self) -> Result<u64, Box<dyn Error>> {
+        let _guard = self.tree_lock.read().unwrap();
         self.pager.fuzzy_checkpoint()
     }
 
-    pub fn recover(&mut self) -> Result<pager::RecoveryReport, Box<dyn Error>> {
+    pub fn recover(&self) -> Result<pager::RecoveryReport, Box<dyn Error>> {
+        let _guard = self.tree_lock.write().unwrap();
         let report = self.pager.recover()?;
-        for id in 0..self.pager.index.next_id {
+        let next_id = self.pager.index.next_id.load(Ordering::SeqCst);
+        for id in 0..next_id {
             if let Ok(hdr) = self.pager.index.fetch(id).header()
                 && hdr.page_ty == PageKind::Root
             {
-                self.root_id = id;
+                self.root_id.store(id, Ordering::Release);
                 break;
             }
         }
@@ -106,9 +118,10 @@ impl BplusTree {
     /// Traverses the tree, finds the cell content in page
     /// i.e. the offset & size of the actual data in the heap file
     /// returns a &Vec<u8> of the data, the callers can transmute it.
-    pub fn get(&mut self, txn_id: u64, key: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    pub fn get(&self, txn_id: u64, key: u64) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let _guard = self.tree_lock.read().unwrap();
         let _ = txn_id;
-        let mut page_id = self.root_id;
+        let mut page_id = self.root_id.load(Ordering::Acquire);
         loop {
             let (cells, p_hdr) = {
                 let page = self.pager.index.fetch(page_id);
@@ -156,15 +169,13 @@ impl BplusTree {
         }
     }
 
-    // TODO: update the data records to contain more metadata about the
-    // inserted item for a better labled addressing of the data memebers,
-    // updates can mess up things if we're not careful withi it.
     pub fn insert(
-        &mut self,
+        &self,
         txn_id: u64,
         key: u64,
         data_records: Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
+        let _guard = self.tree_lock.write().unwrap();
         let breadcrumbs = self.breadcrumbs(key)?;
 
         if breadcrumbs.found {
@@ -182,20 +193,22 @@ impl BplusTree {
         // index file current page
         let heap_page_id = self.pager.heap.allocate();
         {
-            let heap_page = self.pager.heap.fetch_mut(heap_page_id)?;
+            let mut heap_page = self.pager.heap.fetch_mut(heap_page_id)?;
             let old_data = heap_page.data;
             heap_page.add_records(data_records)?;
             let new_data = heap_page.data;
+            drop(heap_page);
             self.pager
                 .log_heap_diff(txn_id, heap_page_id, &old_data, &new_data)?;
         }
 
         // now we can store the cell in the index page itself.
         let n_slot = {
-            let page = self.pager.index.fetch_mut(index_page_id);
+            let mut page = self.pager.index.fetch_mut(index_page_id);
             let old_data = page.data;
             let n_slot = page.add_cell(key, heap_page_id)?;
             let new_data = page.data;
+            drop(page);
             self.pager
                 .log_index_diff(txn_id, index_page_id, &old_data, &new_data)?;
             n_slot
@@ -205,7 +218,7 @@ impl BplusTree {
             // index page was popped off so we need to re-insert
             breadcrumbs.push(index_page_id);
             match self.handle_overfull(txn_id, &mut breadcrumbs)? {
-                Some(new_id) => self.root_id = new_id,
+                Some(new_id) => self.root_id.store(new_id, Ordering::Release),
                 None => return Ok(()),
             }
         }
@@ -214,7 +227,7 @@ impl BplusTree {
     }
 
     pub fn insert_with_txn(
-        &mut self,
+        &self,
         txn_id: u64,
         key: u64,
         data_records: Vec<Vec<u8>>,
@@ -223,7 +236,7 @@ impl BplusTree {
     }
 
     fn handle_overfull(
-        &mut self,
+        &self,
         txn_id: u64,
         breadcrumbs: &mut Vec<u64>,
     ) -> Result<Option<u64>, Box<dyn Error>> {
@@ -273,7 +286,7 @@ impl BplusTree {
 
             let old_data = self.pager.index.fetch(overflow_page_id).data;
             let new_data = {
-                let left_page = self.pager.index.fetch_mut(overflow_page_id);
+                let mut left_page = self.pager.index.fetch_mut(overflow_page_id);
                 left_page.rebuild_from_cells(
                     left_cells,
                     PageKind::Leaf,
@@ -287,7 +300,7 @@ impl BplusTree {
 
             let old_data = self.pager.index.fetch(right_page_id).data;
             let new_data = {
-                let right_page = self.pager.index.fetch_mut(right_page_id);
+                let mut right_page = self.pager.index.fetch_mut(right_page_id);
                 let right_data: Vec<Cell> = right_cells_with_promoted
                     .into_iter()
                     .map(|c| Cell {
@@ -316,7 +329,7 @@ impl BplusTree {
 
             let old_data = self.pager.index.fetch(overflow_page_id).data;
             let new_data = {
-                let left_page = self.pager.index.fetch_mut(overflow_page_id);
+                let mut left_page = self.pager.index.fetch_mut(overflow_page_id);
                 left_page.rebuild_from_cells(
                     left_cells,
                     PageKind::Internal,
@@ -330,7 +343,7 @@ impl BplusTree {
 
             let old_data = self.pager.index.fetch(right_page_id).data;
             let new_data = {
-                let right_page = self.pager.index.fetch_mut(right_page_id);
+                let mut right_page = self.pager.index.fetch_mut(right_page_id);
                 let right_data: Vec<Cell> = right_cells
                     .iter()
                     .map(|c| Cell {
@@ -355,7 +368,7 @@ impl BplusTree {
         if let Some(&parent_id) = breadcrumbs.last() {
             let old_data = self.pager.index.fetch(parent_id).data;
             let (n_slot, new_data) = {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
                 let parent_hdr = parent_page.header()?;
 
                 let parent_cells = parent_page.get_cells()?;
@@ -402,7 +415,7 @@ impl BplusTree {
             let new_root_id = self.pager.index.allocate(PageKind::Root);
             let old_data = self.pager.index.fetch(new_root_id).data;
             let new_data = {
-                let root_page = self.pager.index.fetch_mut(new_root_id);
+                let mut root_page = self.pager.index.fetch_mut(new_root_id);
                 root_page.init_header(new_root_id, PageKind::Root, right_page_id);
                 root_page.add_cell(promote_cell.key, overflow_page_id)?;
                 root_page.data
@@ -412,7 +425,7 @@ impl BplusTree {
 
             let old_data = self.pager.index.fetch(overflow_page_id).data;
             let new_data = {
-                let left_page = self.pager.index.fetch_mut(overflow_page_id);
+                let mut left_page = self.pager.index.fetch_mut(overflow_page_id);
                 let hdr = left_page.header()?;
                 if hdr.page_ty == PageKind::Root {
                     left_page.set_page_kind(PageKind::Internal)?;
@@ -426,7 +439,8 @@ impl BplusTree {
         }
     }
 
-    pub fn delete(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
+    pub fn delete(&self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
+        let _guard = self.tree_lock.write().unwrap();
         let crumbs = self.breadcrumbs(key)?;
 
         if !crumbs.found {
@@ -441,7 +455,7 @@ impl BplusTree {
 
         let old_leaf_data = self.pager.index.fetch(leaf_id).data;
         let remaining = {
-            let leaf_page = self.pager.index.fetch_mut(leaf_id);
+            let mut leaf_page = self.pager.index.fetch_mut(leaf_id);
             let cells = leaf_page.get_cells()?;
             let idx = cells
                 .binary_search_by(|c| c.key.cmp(&key))
@@ -454,7 +468,7 @@ impl BplusTree {
         self.pager
             .log_index_diff(txn_id, leaf_id, &old_leaf_data, &new_leaf_data)?;
 
-        if leaf_id == self.root_id {
+        if leaf_id == self.root_id.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -469,12 +483,12 @@ impl BplusTree {
         Ok(())
     }
 
-    pub fn delete_with_txn(&mut self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
+    pub fn delete_with_txn(&self, txn_id: u64, key: u64) -> Result<(), Box<dyn Error>> {
         self.delete(txn_id, key)
     }
 
     fn propagate_key_update(
-        &mut self,
+        &self,
         txn_id: u64,
         old_key: u64,
         child_id: u64,
@@ -503,7 +517,7 @@ impl BplusTree {
             if let Some(idx) = found_idx {
                 let old_data = self.pager.index.fetch(ancestor_id).data;
                 let new_data = {
-                    let page = self.pager.index.fetch_mut(ancestor_id);
+                    let mut page = self.pager.index.fetch_mut(ancestor_id);
                     let hdr = page.header()?;
                     let cells = page.get_cells()?;
 
@@ -539,7 +553,7 @@ impl BplusTree {
     }
 
     fn handle_underfull(
-        &mut self,
+        &self,
         txn_id: u64,
         underfull_id: u64,
         ancestors: &mut Vec<u64>,
@@ -678,7 +692,7 @@ impl BplusTree {
     }
 
     fn redistribute_from_left(
-        &mut self,
+        &self,
         txn_id: u64,
         left_id: u64,
         underfull_id: u64,
@@ -690,7 +704,7 @@ impl BplusTree {
 
         let old_left_data = self.pager.index.fetch(left_id).data;
         let (borrowed_cell, separator_idx) = {
-            let left_page = self.pager.index.fetch_mut(left_id);
+            let mut left_page = self.pager.index.fetch_mut(left_id);
             let left_cells = left_page.get_cells()?;
             let last_idx = left_cells.len() - 1;
             let cell = left_page.remove_cell_at(last_idx)?;
@@ -704,7 +718,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
                 underfull_page.add_cell(borrowed_cell.key, value)?;
             }
@@ -727,7 +741,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(new_separator, left_id)?;
             }
@@ -748,7 +762,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
 
                 let underfull_cells = underfull_page.get_cells()?;
                 let all_cells: Vec<slotted_page::Cell> = std::iter::once(slotted_page::Cell {
@@ -776,7 +790,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(borrowed_cell.key, left_id)?;
             }
@@ -785,7 +799,7 @@ impl BplusTree {
                 .log_index_diff(txn_id, parent_id, &old_parent_data, &new_parent_data)?;
 
             {
-                let left_page = self.pager.index.fetch_mut(left_id);
+                let mut left_page = self.pager.index.fetch_mut(left_id);
                 if let Some(c) = borrowed_cell.c_ptr {
                     left_page.set_header_ptr(c)?;
                 }
@@ -799,7 +813,7 @@ impl BplusTree {
     }
 
     fn redistribute_from_right(
-        &mut self,
+        &self,
         txn_id: u64,
         underfull_id: u64,
         right_id: u64,
@@ -811,7 +825,7 @@ impl BplusTree {
 
         let old_right_data = self.pager.index.fetch(right_id).data;
         let borrowed_cell = {
-            let right_page = self.pager.index.fetch_mut(right_id);
+            let mut right_page = self.pager.index.fetch_mut(right_id);
             right_page.remove_cell_at(0)?
         };
 
@@ -824,7 +838,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let value = borrowed_cell.h_ptr.as_ref().unwrap().index;
                 underfull_page.add_cell(borrowed_cell.key, value)?;
             }
@@ -844,7 +858,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(new_separator, underfull_id)?;
             }
@@ -866,7 +880,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
                 let old_ptr = underfull_page.header()?.ptr;
                 underfull_page.add_cell(parent_sep_key, old_ptr)?;
                 underfull_page.set_header_ptr(borrowed_left_child)?;
@@ -881,7 +895,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
                 parent_page.remove_cell_at(separator_idx)?;
                 parent_page.add_cell(borrowed_cell.key, underfull_id)?;
             }
@@ -894,7 +908,7 @@ impl BplusTree {
     }
 
     fn merge_with_left(
-        &mut self,
+        &self,
         txn_id: u64,
         left_id: u64,
         underfull_id: u64,
@@ -926,7 +940,7 @@ impl BplusTree {
 
             let old_left_data = self.pager.index.fetch(left_id).data;
             {
-                let left_page = self.pager.index.fetch_mut(left_id);
+                let mut left_page = self.pager.index.fetch_mut(left_id);
                 left_page.rebuild_from_cells(
                     &merged,
                     PageKind::Leaf,
@@ -940,7 +954,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
 
                 parent_page.remove_cell_at(separator_idx)?;
 
@@ -990,7 +1004,7 @@ impl BplusTree {
 
             let old_left_data = self.pager.index.fetch(left_id).data;
             {
-                let left_page = self.pager.index.fetch_mut(left_id);
+                let mut left_page = self.pager.index.fetch_mut(left_id);
                 left_page.rebuild_from_cells(
                     &merged,
                     PageKind::Internal,
@@ -1004,7 +1018,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
 
                 parent_page.remove_cell_at(separator_idx)?;
 
@@ -1042,7 +1056,7 @@ impl BplusTree {
     }
 
     fn merge_with_right(
-        &mut self,
+        &self,
         txn_id: u64,
         underfull_id: u64,
         right_id: u64,
@@ -1074,7 +1088,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
                 underfull_page.rebuild_from_cells(
                     &merged,
                     PageKind::Leaf,
@@ -1092,7 +1106,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
 
                 parent_page.remove_cell_at(separator_idx)?;
 
@@ -1144,7 +1158,7 @@ impl BplusTree {
 
             let old_underfull_data = self.pager.index.fetch(underfull_id).data;
             {
-                let underfull_page = self.pager.index.fetch_mut(underfull_id);
+                let mut underfull_page = self.pager.index.fetch_mut(underfull_id);
                 underfull_page.rebuild_from_cells(
                     &merged,
                     PageKind::Internal,
@@ -1162,7 +1176,7 @@ impl BplusTree {
 
             let old_parent_data = self.pager.index.fetch(parent_id).data;
             {
-                let parent_page = self.pager.index.fetch_mut(parent_id);
+                let mut parent_page = self.pager.index.fetch_mut(parent_id);
 
                 parent_page.remove_cell_at(separator_idx)?;
 
@@ -1202,12 +1216,12 @@ impl BplusTree {
     }
 
     fn check_parent_underfull(
-        &mut self,
+        &self,
         txn_id: u64,
         parent_id: u64,
         ancestors: &mut Vec<u64>,
     ) -> Result<(), Box<dyn Error>> {
-        if parent_id == self.root_id {
+        if parent_id == self.root_id.load(Ordering::Acquire) {
             let (root_cells_empty, new_root_id) = {
                 let root_page = self.pager.index.fetch(parent_id);
                 let root_cells = root_page.get_cells()?;
@@ -1218,14 +1232,14 @@ impl BplusTree {
             if root_cells_empty {
                 let old_root_data = self.pager.index.fetch(new_root_id).data;
                 {
-                    let new_root = self.pager.index.fetch_mut(new_root_id);
+                    let mut new_root = self.pager.index.fetch_mut(new_root_id);
                     new_root.set_page_kind(PageKind::Root)?;
                 }
                 let new_root_data = self.pager.index.fetch(new_root_id).data;
                 self.pager
                     .log_index_diff(txn_id, new_root_id, &old_root_data, &new_root_data)?;
 
-                self.root_id = new_root_id;
+                self.root_id.store(new_root_id, Ordering::Release);
             }
 
             return Ok(());
@@ -1244,10 +1258,10 @@ impl BplusTree {
         Ok(())
     }
 
-    fn breadcrumbs(&mut self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
+    fn breadcrumbs(&self, key: u64) -> Result<BreadCrumbs, Box<dyn Error>> {
         let mut breadcrumb: Vec<u64> = Vec::new();
 
-        let mut page_id = self.root_id;
+        let mut page_id = self.root_id.load(Ordering::Acquire);
 
         loop {
             let (cells, p_hdr) = {
@@ -1321,7 +1335,7 @@ mod test {
     #[test]
     fn single_insert_and_get() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"hello".to_vec()]).unwrap();
 
@@ -1332,7 +1346,7 @@ mod test {
     #[test]
     fn insert_and_get_multiple_keys_in_root() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 5u64, vec![b"five".to_vec()]).unwrap();
         btree.insert(0, 3u64, vec![b"three".to_vec()]).unwrap();
@@ -1348,7 +1362,7 @@ mod test {
     #[test]
     fn get_nonexistent_key_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
 
@@ -1359,7 +1373,7 @@ mod test {
     #[test]
     fn duplicate_insert_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
         let result = btree.insert(0, 1u64, vec![b"one again".to_vec()]);
@@ -1369,7 +1383,7 @@ mod test {
     #[test]
     fn insert_and_get_multiple_data_records() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let records = vec![b"field1".to_vec(), b"field2".to_vec(), b"field3".to_vec()];
         btree.insert(0, 42u64, records.clone()).unwrap();
@@ -1381,7 +1395,7 @@ mod test {
     #[test]
     fn delete_from_root_leaf() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
         btree.insert(0, 2u64, vec![b"two".to_vec()]).unwrap();
@@ -1397,7 +1411,7 @@ mod test {
     #[test]
     fn delete_nonexistent_key_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
         let result = btree.delete(0, 999u64);
@@ -1407,7 +1421,7 @@ mod test {
     #[test]
     fn delete_all_from_root() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"one".to_vec()]).unwrap();
         btree.insert(0, 2u64, vec![b"two".to_vec()]).unwrap();
@@ -1422,7 +1436,7 @@ mod test {
     #[test]
     fn insert_ascending_order() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         for i in 1..=20u64 {
             btree
@@ -1439,7 +1453,7 @@ mod test {
     #[test]
     fn insert_descending_order() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         for i in (1..=20u64).rev() {
             btree
@@ -1456,7 +1470,7 @@ mod test {
     #[test]
     fn many_inserts_cause_splits() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = ORDER as u64 * 4;
         for i in 1..=count {
@@ -1482,7 +1496,7 @@ mod test {
     #[test]
     fn internal_node_exact_separator_lookups() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = ORDER as u64 * 3;
         for i in (1..=count).step_by(2) {
@@ -1506,7 +1520,7 @@ mod test {
     #[test]
     fn internal_node_deletion_and_merge() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = ORDER as u64 * 3;
         for i in 1..=count {
@@ -1551,7 +1565,7 @@ mod test {
     #[test]
     fn internal_node_root_collapse_on_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = ORDER as u64 * 2;
         for i in 1..=count {
@@ -1578,7 +1592,7 @@ mod test {
     #[test]
     fn multi_level_mixed_workload() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = 300u64;
         for i in 1..=count {
@@ -1619,7 +1633,7 @@ mod test {
     #[test]
     fn delete_all_from_multi_level_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let count = ORDER as u64 * 2;
         for i in 1..=count {
@@ -1646,7 +1660,7 @@ mod test {
     #[test]
     fn insert_delete_reinsert() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1u64, vec![b"first".to_vec()]).unwrap();
         btree.delete(0, 1u64).unwrap();
@@ -1658,7 +1672,7 @@ mod test {
     #[test]
     fn empty_tree_get_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         assert!(btree.get(0, 1u64).is_err());
     }
@@ -1666,7 +1680,7 @@ mod test {
     #[test]
     fn large_data_records() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let big_data = vec![0xABu8; 4000];
         btree.insert(0, 1u64, vec![big_data.clone()]).unwrap();
@@ -1678,7 +1692,7 @@ mod test {
     #[test]
     fn interleaved_insert_and_get() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         for i in 1..=10u64 {
             btree
@@ -1692,7 +1706,7 @@ mod test {
     #[test]
     fn boundary_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 0u64, vec![b"zero".to_vec()]).unwrap();
         btree.insert(0, u64::MAX, vec![b"max".to_vec()]).unwrap();
@@ -1710,7 +1724,7 @@ mod test {
         let heap_path = dir.path().join("heap_file.db");
 
         {
-            let mut btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
+            let btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
             for i in 1..=50u64 {
                 btree
                     .insert(0, i, vec![format!("value-{}", i).into_bytes()])
@@ -1721,9 +1735,10 @@ mod test {
 
         {
             let reopened = Pager::new(index_path, heap_path).unwrap();
-            let mut btree = BplusTree {
-                root_id: 0,
+            let btree = BplusTree {
+                root_id: AtomicU64::new(0),
                 pager: reopened,
+                tree_lock: RwLock::new(()),
             };
             for i in 1..=50u64 {
                 let res = btree.get(0, i).unwrap();
@@ -1735,7 +1750,7 @@ mod test {
     #[test]
     fn buffer_pool_discard_dirty_simulation() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 1, vec![b"first".to_vec()]).unwrap();
         btree.pager.flush_all().unwrap();
@@ -1752,7 +1767,7 @@ mod test {
     #[test]
     fn wal_transaction_commit_and_abort() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1781,7 +1796,7 @@ mod test {
     #[test]
     fn wal_steal_flush_lsn_invariant() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1794,14 +1809,14 @@ mod test {
             let page_lsn = btree.pager.index.pool.page_lsn(page_id);
             assert!(page_lsn > 0);
             btree.pager.flush_index_page(page_id).unwrap();
-            assert!(btree.pager.wal.flushed_lsn >= page_lsn);
+            assert!(btree.pager.wal.flushed_lsn() >= page_lsn);
         }
     }
 
     #[test]
     fn fuzzy_checkpointing_preserves_dirty_pages_and_records_dpt_att() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1813,7 +1828,7 @@ mod test {
 
         let cp_lsn = btree.fuzzy_checkpoint().unwrap();
         assert!(cp_lsn > 0);
-        assert_eq!(btree.pager.wal.header.last_checkpoint_lsn, cp_lsn);
+        assert_eq!(btree.pager.wal.last_checkpoint_lsn(), cp_lsn);
 
         let all = btree.pager.wal.read_all_records().unwrap();
         let cp_rec = all.iter().find(|r| r.header.lsn == cp_lsn).unwrap();
@@ -1835,7 +1850,7 @@ mod test {
     #[test]
     fn crash_recovery_redo_and_undo_with_fuzzy_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1875,7 +1890,7 @@ mod test {
     #[test]
     fn crash_recovery_undo_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1913,7 +1928,7 @@ mod test {
     #[test]
     fn fuzzy_checkpoint_recovery_idempotence() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -1956,7 +1971,7 @@ mod test {
     #[test]
     fn crash_recovery_multi_level_tree_splits() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         let t1 = 1;
         btree.begin_transaction(t1).unwrap();
@@ -2018,7 +2033,7 @@ mod test {
         let heap_path = dir.path().join("heap_file.db");
 
         {
-            let mut btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
+            let btree = BplusTree::new(index_path.clone(), heap_path.clone()).unwrap();
             let t1 = 1;
             btree.begin_transaction(t1).unwrap();
             btree.insert(t1, 100, vec![b"first_val".to_vec()]).unwrap();
@@ -2046,7 +2061,7 @@ mod test {
         }
 
         {
-            let mut btree = BplusTree::new(index_path, heap_path).unwrap();
+            let btree = BplusTree::new(index_path, heap_path).unwrap();
             btree.recover().unwrap();
 
             assert_eq!(btree.get(0, 100).unwrap(), vec![b"first_val".to_vec()]);
@@ -2058,7 +2073,7 @@ mod test {
     #[test]
     fn caller_provided_transaction_id_flow() {
         let dir = tempfile::tempdir().unwrap();
-        let mut btree = get_btree_in(dir.path());
+        let btree = get_btree_in(dir.path());
 
         btree.insert(0, 10, vec![b"autocommit".to_vec()]).unwrap();
         assert_eq!(btree.get(0, 10).unwrap(), vec![b"autocommit".to_vec()]);
