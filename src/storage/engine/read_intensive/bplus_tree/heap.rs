@@ -8,6 +8,8 @@
 // TODO: implement overflow pages cus they are bound to exist
 
 use std::fs::File;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{error::Error, os::unix::fs::FileExt};
 
 use crate::storage::engine::read_intensive::bplus_tree::header::HEAP_HEADER_SIZE;
@@ -26,8 +28,34 @@ const HEAP_POOL_CAPACITY: usize = 10_000;
 pub(super) struct Heap {
     pub heap_file: File,
     pub path: std::path::PathBuf,
-    pub next_id: u64,
+    pub next_id: AtomicU64,
     pub pool: BufferPool<HeapPage>,
+}
+
+pub(super) struct HeapPageGuard<'a> {
+    heap: &'a Heap,
+    id: u64,
+    page: HeapPage,
+}
+
+impl<'a> Deref for HeapPageGuard<'a> {
+    type Target = HeapPage;
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl<'a> DerefMut for HeapPageGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.page
+    }
+}
+
+impl<'a> Drop for HeapPageGuard<'a> {
+    fn drop(&mut self) {
+        self.heap.pool.update_page(self.id, self.page);
+        self.heap.pool.unpin(self.id);
+    }
 }
 
 impl Heap {
@@ -39,12 +67,13 @@ impl Heap {
         Heap {
             heap_file,
             path,
-            next_id,
+            next_id: AtomicU64::new(next_id),
             pool: BufferPool::new(HEAP_POOL_CAPACITY),
         }
     }
+
     pub fn get_record(
-        &mut self,
+        &self,
         id: u64,
         data_records: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -72,7 +101,7 @@ impl Heap {
     }
 
     pub fn collect_overflow_records(
-        &mut self,
+        &self,
         overflow_id: u64,
         data_records: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -100,7 +129,7 @@ impl Heap {
     }
 
     fn get_cell_ptr(buf: &[u8], header: &HeapHeader) -> Vec<CellPointer> {
-        let range = (header.free_start - HEADER_SIZE as u16) / 4; // cell offset + cell size = 4 bytes
+        let range = (header.free_start - HEADER_SIZE as u16) / 4;
         // NOTE: here we can derive that a single cellpointer is a
         // data member's pointer of a row.
         let mut cell_ptr: Vec<CellPointer> = Vec::with_capacity(range as usize);
@@ -112,39 +141,37 @@ impl Heap {
         cell_ptr
     }
 
-    pub fn fetch(&mut self, id: u64) -> Result<&HeapPage, Box<dyn Error>> {
-        if !self.pool.contains(id) {
-            let page = self.read_page_from_disk(id)?;
-            if let Some(evicted) = self.pool.insert(id, page)?
-                && evicted.was_dirty
-            {
-                self.heap_file
-                    .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
-            }
+    pub fn fetch(&self, id: u64) -> Result<HeapPage, Box<dyn Error>> {
+        if let Some(page) = self.pool.get(id) {
+            return Ok(page);
         }
-        self.pool
-            .get(id)
-            .ok_or("Page not in pool after fetch".into())
+        let page = self.read_page_from_disk(id)?;
+        if let Some(evicted) = self.pool.insert(id, page)?
+            && evicted.was_dirty
+        {
+            self.heap_file
+                .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
+        }
+        Ok(page)
     }
 
-    pub fn fetch_mut(&mut self, id: u64) -> Result<&mut HeapPage, Box<dyn Error>> {
-        if !self.pool.contains(id) {
-            let page = self.read_page_from_disk(id)?;
-            if let Some(evicted) = self.pool.insert(id, page)?
-                && evicted.was_dirty
-            {
-                self.heap_file
-                    .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
-            }
-        }
+    pub fn fetch_mut(&self, id: u64) -> Result<HeapPageGuard<'_>, Box<dyn Error>> {
+        let page = self.fetch(id)?;
+        self.pool.pin(id);
         self.pool.mark_dirty(id);
-        self.pool
-            .get_mut(id)
-            .ok_or("Page not in pool after fetch_mut".into())
+        Ok(HeapPageGuard {
+            heap: self,
+            id,
+            page,
+        })
     }
 
-    pub fn allocate(&mut self) -> u64 {
-        let id = self.next_id;
+    pub fn write_page(&self, id: u64, page: HeapPage) {
+        self.pool.update_page(id, page);
+    }
+
+    pub fn allocate(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let end_offset = Self::page_offset(id) + PAGE_SIZE as u64;
         self.heap_file
@@ -175,37 +202,30 @@ impl Heap {
         }
         self.pool.mark_dirty(id);
 
-        self.next_id += 1;
         id
     }
 
-    pub fn allocate_primary(&mut self) -> u64 {
+    pub fn allocate_primary(&self) -> u64 {
         let id = self.allocate();
-        let page = self.pool.get_mut(id).unwrap();
+        let mut page = self.fetch_mut(id).unwrap();
         let header = HeapHeader::new_primary(id);
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        self.pool.mark_dirty(id);
         id
     }
 
-    pub fn allocate_overflow(&mut self) -> u64 {
+    pub fn allocate_overflow(&self) -> u64 {
         let id = self.allocate();
-        let page = self.pool.get_mut(id).unwrap();
+        let mut page = self.fetch_mut(id).unwrap();
         let header = HeapHeader::new_overflow(id);
         header.serialize(&mut page.data[..HEADER_SIZE]);
-        self.pool.mark_dirty(id);
         id
     }
 
-    /// Inserts the data records in the specified heap page.
     pub fn insert_records(
-        &mut self,
+        &self,
         primary_page_id: u64,
         data_record: Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
-        // First tails till the end of overflow pages (if they exist)
-        // check if theres enough space, if yes insert the record
-        // else insert a new page and insert.
         let header = {
             let page = self.fetch(primary_page_id)?;
             page.header()?
@@ -227,20 +247,20 @@ impl Heap {
             };
 
             if remaining >= needed {
-                let page = self.fetch_mut(current_id)?;
+                let mut page = self.fetch_mut(current_id)?;
                 page.add_cell(record)?;
             } else {
                 let overflow_id = self.allocate_overflow();
 
                 {
-                    let current_page = self.fetch_mut(current_id)?;
+                    let mut current_page = self.fetch_mut(current_id)?;
                     let mut hdr = current_page.header()?;
                     hdr.set_has_overflow(overflow_id);
                     hdr.serialize(&mut current_page.data[..HEADER_SIZE]);
                 }
 
                 {
-                    let overflow_page = self.fetch_mut(overflow_id)?;
+                    let mut overflow_page = self.fetch_mut(overflow_id)?;
                     overflow_page.add_cell(record)?;
                 }
 
@@ -258,7 +278,7 @@ impl Heap {
         Ok(HeapPage { data: buf })
     }
 
-    pub fn flush(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
+    pub fn flush(&self, id: u64) -> Result<(), Box<dyn Error>> {
         if self.pool.is_dirty(id)
             && let Some(page) = self.pool.get(id)
         {
@@ -269,7 +289,7 @@ impl Heap {
         Ok(())
     }
 
-    pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn flush_all(&self) -> Result<(), Box<dyn Error>> {
         let dirty_ids = self.pool.dirty_page_ids();
         for id in dirty_ids {
             if let Some(page) = self.pool.get(id) {
@@ -281,14 +301,14 @@ impl Heap {
         Ok(())
     }
 
-    pub fn discard_dirty(&mut self) {
+    pub fn discard_dirty(&self) {
         let dirty_ids = self.pool.dirty_page_ids();
         for id in dirty_ids {
             self.pool.remove(id);
         }
     }
 
-    fn find_tail_id(&mut self, id: u64) -> Result<u64, Box<dyn Error>> {
+    fn find_tail_id(&self, id: u64) -> Result<u64, Box<dyn Error>> {
         let mut cur_id = id;
         loop {
             let hdr = {
@@ -304,7 +324,7 @@ impl Heap {
     }
 
     /// returns the chain of ptr from primary to the last overflow page
-    pub fn free_chain(&mut self, primary_id: u64) -> Result<Vec<u64>, Box<dyn Error>> {
+    pub fn free_chain(&self, primary_id: u64) -> Result<Vec<u64>, Box<dyn Error>> {
         let mut chain = vec![primary_id];
         let mut cur_id = primary_id;
         loop {

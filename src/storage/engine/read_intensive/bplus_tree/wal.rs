@@ -27,6 +27,8 @@ use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::engine::read_intensive::bplus_tree::wal_buffer::WalBuffer;
 
@@ -217,7 +219,7 @@ impl WalRecord {
     }
 }
 
-pub(super) struct Wal {
+pub(super) struct WalInner {
     pub log_file: File,
     pub log_path: PathBuf,
     pub wal_buffer: WalBuffer,
@@ -226,59 +228,7 @@ pub(super) struct Wal {
     pub active_txns: HashMap<u64, u64>,
 }
 
-impl Wal {
-    pub fn new(log_path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let log_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&log_path)?;
-
-        let existing_len = log_file.metadata()?.len();
-
-        let header = if existing_len == 0 {
-            // fresh WAL, never initialized
-            let h = WalHeader {
-                last_checkpoint_lsn: 0,
-                last_wal_offset: WAL_HEADER_SIZE as u64,
-                last_wal_len: 0,
-                next_lsn: 0,
-            };
-            let mut buf = [0u8; WAL_HEADER_SIZE];
-            h.serialize(&mut buf);
-            log_file.write_all_at(&buf, 0)?;
-            log_file.sync_all()?;
-            h
-        } else if existing_len >= WAL_HEADER_SIZE as u64 {
-            // existing WAL
-            let mut buf = [0u8; WAL_HEADER_SIZE];
-            log_file.read_exact_at(&mut buf, 0)?;
-            WalHeader::deserialize(&buf).ok_or("corrupt wal header")?
-        } else {
-            // 1..WAL_HEADER_SIZE bytes; torn/corrupted
-            return Err("wal file exists but header is truncated/corrupt".into());
-        };
-
-        let flushed_lsn = if header.next_lsn == 0 {
-            0
-        } else {
-            header.next_lsn - 1
-        };
-
-        let active_txns = HashMap::new();
-        let wal_buffer = WalBuffer::new(WAL_POOL_CAPACITY);
-
-        Ok(Self {
-            log_file,
-            log_path,
-            wal_buffer,
-            header,
-            flushed_lsn,
-            active_txns,
-        })
-    }
-
+impl WalInner {
     pub fn write_raw_record(
         &mut self,
         txn_id: u64,
@@ -509,28 +459,213 @@ impl Wal {
             .map(|(&txn_id, &last_lsn)| ActiveTxnEntry { txn_id, last_lsn })
             .collect()
     }
+}
 
-    pub fn read_record_at(&self, file_offset: u64) -> Result<(WalRecord, u64), Box<dyn Error>> {
+pub(super) struct Wal {
+    pub inner: Mutex<WalInner>,
+    pub flushed_lsn: AtomicU64,
+}
+
+impl Wal {
+    pub fn new(log_path: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let log_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&log_path)?;
+
+        let existing_len = log_file.metadata()?.len();
+
+        let header = if existing_len == 0 {
+            let h = WalHeader {
+                last_checkpoint_lsn: 0,
+                last_wal_offset: WAL_HEADER_SIZE as u64,
+                last_wal_len: 0,
+                next_lsn: 0,
+            };
+            let mut buf = [0u8; WAL_HEADER_SIZE];
+            h.serialize(&mut buf);
+            log_file.write_all_at(&buf, 0)?;
+            log_file.sync_all()?;
+            h
+        } else if existing_len >= WAL_HEADER_SIZE as u64 {
+            let mut buf = [0u8; WAL_HEADER_SIZE];
+            log_file.read_exact_at(&mut buf, 0)?;
+            WalHeader::deserialize(&buf).ok_or("corrupt wal header")?
+        } else {
+            return Err("wal file exists but header is truncated/corrupt".into());
+        };
+
+        let flushed_lsn = if header.next_lsn == 0 {
+            0
+        } else {
+            header.next_lsn - 1
+        };
+
+        let active_txns = HashMap::new();
+        let wal_buffer = WalBuffer::new(WAL_POOL_CAPACITY);
+
+        Ok(Self {
+            inner: Mutex::new(WalInner {
+                log_file,
+                log_path,
+                wal_buffer,
+                header,
+                flushed_lsn,
+                active_txns,
+            }),
+            flushed_lsn: AtomicU64::new(flushed_lsn),
+        })
+    }
+
+    pub fn flushed_lsn(&self) -> u64 {
+        self.flushed_lsn.load(Ordering::Acquire)
+    }
+
+    pub fn last_checkpoint_lsn(&self) -> u64 {
+        self.inner.lock().unwrap().header.last_checkpoint_lsn
+    }
+
+    pub fn header(&self) -> WalHeader {
+        self.inner.lock().unwrap().header
+    }
+
+    pub fn write_raw_record(
+        &self,
+        txn_id: u64,
+        record_type: RecordType,
+        page_id: u64,
+        is_index: bool,
+        payload_page_offset: u16,
+        payload: &[u8],
+    ) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.write_raw_record(
+            txn_id,
+            record_type,
+            page_id,
+            is_index,
+            payload_page_offset,
+            payload,
+        )?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn write_record(
+        &self,
+        txn_id: u64,
+        record_type: RecordType,
+        page_id: u64,
+        is_index: bool,
+        payload: UpdatePayload,
+    ) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.write_record(txn_id, record_type, page_id, is_index, payload)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn begin_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let tid = inner.begin_transaction(txn_id)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(tid)
+    }
+
+    pub fn commit_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.commit_transaction(txn_id)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn abort_transaction(&self, txn_id: u64) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.abort_transaction(txn_id)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn write_clr(
+        &self,
+        txn_id: u64,
+        is_index: bool,
+        page_id: u64,
+        payload_page_offset: u16,
+        redo_data: &[u8],
+    ) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.write_clr(txn_id, is_index, page_id, payload_page_offset, redo_data)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn write_checkpoint(
+        &self,
+        dpt: &[DirtyPageEntry],
+        att: &[ActiveTxnEntry],
+    ) -> Result<u64, Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        let lsn = inner.write_checkpoint(dpt, att)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(lsn)
+    }
+
+    pub fn flush_header(&self) -> Result<(), Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.flush_header()
+    }
+
+    pub fn flush_up_to(&self, target_lsn: u64) -> Result<(), Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.flush_up_to(target_lsn)?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn flush_all(&self) -> Result<(), Box<dyn Error>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.flush_all()?;
+        self.flushed_lsn.store(inner.flushed_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn active_transaction_table(&self) -> Vec<ActiveTxnEntry> {
+        let inner = self.inner.lock().unwrap();
+        inner.active_transaction_table()
+    }
+
+    fn read_record_at_file(
+        log_file: &File,
+        file_offset: u64,
+    ) -> Result<(WalRecord, u64), Box<dyn Error>> {
         let mut header_buf = [0u8; WAL_RECORD_HEADER_SIZE];
-        self.log_file.read_exact_at(&mut header_buf, file_offset)?;
+        log_file.read_exact_at(&mut header_buf, file_offset)?;
         let header =
             WalRecordHeader::deserialize(&header_buf).ok_or("Corrupt WAL record header")?;
         let mut payload = vec![0u8; header.payload_len as usize];
         if header.payload_len > 0 {
-            self.log_file
-                .read_exact_at(&mut payload, file_offset + WAL_RECORD_HEADER_SIZE as u64)?;
+            log_file.read_exact_at(&mut payload, file_offset + WAL_RECORD_HEADER_SIZE as u64)?;
         }
         let next_offset = file_offset + WAL_RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
         Ok((WalRecord { header, payload }, next_offset))
     }
 
+    pub fn read_record_at(&self, file_offset: u64) -> Result<(WalRecord, u64), Box<dyn Error>> {
+        let inner = self.inner.lock().unwrap();
+        Self::read_record_at_file(&inner.log_file, file_offset)
+    }
+
     pub fn read_all_records(&self) -> Result<Vec<WalRecord>, Box<dyn Error>> {
-        let file_len = self.log_file.metadata()?.len();
+        let inner = self.inner.lock().unwrap();
+        let file_len = inner.log_file.metadata()?.len();
         let mut offset = WAL_HEADER_SIZE as u64;
         let mut records = Vec::new();
 
         while offset + WAL_RECORD_HEADER_SIZE as u64 <= file_len {
-            let (record, next_offset) = match self.read_record_at(offset) {
+            let (record, next_offset) = match Self::read_record_at_file(&inner.log_file, offset) {
                 Ok(r) => r,
                 Err(_) => break,
             };
@@ -550,14 +685,15 @@ impl Wal {
     // }
 
     pub fn read_records_backward(&self) -> Result<Vec<WalRecord>, Box<dyn Error>> {
+        let inner = self.inner.lock().unwrap();
         let mut records = Vec::new();
-        if self.header.last_wal_len == 0 {
+        if inner.header.last_wal_len == 0 {
             return Ok(records);
         }
 
-        let mut offset = self.header.last_wal_offset;
+        let mut offset = inner.header.last_wal_offset;
         while offset >= WAL_HEADER_SIZE as u64 {
-            let (record, _) = self.read_record_at(offset)?;
+            let (record, _) = Self::read_record_at_file(&inner.log_file, offset)?;
             let prev_len = record.header.prev_record_len;
             records.push(record);
             if prev_len == 0 {

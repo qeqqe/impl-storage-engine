@@ -66,7 +66,6 @@ impl<P: Clone> BufferPoolInner<P> {
                 rec_lsn: 0,
             },
         );
-
         self.touch(id);
 
         Ok(evicted)
@@ -174,8 +173,6 @@ impl<P: Clone> BufferPoolInner<P> {
         self.lru_order.push_back(id);
     }
 
-    /// STEAL policy... any unpinned page can be evicted. if its dirty the
-    /// caller is responsible for writing it back to disk before discarding.
     fn evict_one(&mut self) -> Option<EvictedPage<P>> {
         let mut evict_idx = None;
         for (i, &id) in self.lru_order.iter().enumerate() {

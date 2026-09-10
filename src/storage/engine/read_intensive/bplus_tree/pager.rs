@@ -57,7 +57,7 @@ impl Pager {
     }
 
     pub fn fetch_heap_data(
-        &mut self,
+        &self,
         cell: &Cell,
         data_record: &mut Vec<Vec<u8>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -69,14 +69,14 @@ impl Pager {
         }
     }
 
-    pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn flush_all(&self) -> Result<(), Box<dyn Error>> {
         self.wal.flush_all()?;
         self.index.flush_all()?;
         self.heap.flush_all()?;
         Ok(())
     }
 
-    pub fn flush_index_page(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
+    pub fn flush_index_page(&self, id: u64) -> Result<(), Box<dyn Error>> {
         let lsn = self.index.pool.page_lsn(id);
         if lsn > 0 {
             self.wal.flush_up_to(lsn)?;
@@ -85,7 +85,7 @@ impl Pager {
         Ok(())
     }
 
-    pub fn flush_heap_page(&mut self, id: u64) -> Result<(), Box<dyn Error>> {
+    pub fn flush_heap_page(&self, id: u64) -> Result<(), Box<dyn Error>> {
         let lsn = self.heap.pool.page_lsn(id);
         if lsn > 0 {
             self.wal.flush_up_to(lsn)?;
@@ -94,7 +94,7 @@ impl Pager {
         Ok(())
     }
 
-    pub fn discard_all_dirty(&mut self) {
+    pub fn discard_all_dirty(&self) {
         self.index.discard_dirty();
         self.heap.discard_dirty();
     }
@@ -107,7 +107,7 @@ impl Pager {
     }
 
     pub fn log_index_update(
-        &mut self,
+        &self,
         txn_id: u64,
         page_id: u64,
         offset: u16,
@@ -127,7 +127,7 @@ impl Pager {
     }
 
     pub fn log_heap_update(
-        &mut self,
+        &self,
         txn_id: u64,
         page_id: u64,
         offset: u16,
@@ -147,7 +147,7 @@ impl Pager {
     }
 
     pub fn log_index_diff(
-        &mut self,
+        &self,
         txn_id: u64,
         page_id: u64,
         old_data: &[u8],
@@ -168,7 +168,7 @@ impl Pager {
     }
 
     pub fn log_heap_diff(
-        &mut self,
+        &self,
         txn_id: u64,
         page_id: u64,
         old_data: &[u8],
@@ -188,7 +188,7 @@ impl Pager {
         }
     }
 
-    pub fn fuzzy_checkpoint(&mut self) -> Result<u64, Box<dyn Error>> {
+    pub fn fuzzy_checkpoint(&self) -> Result<u64, Box<dyn Error>> {
         let mut dpt = Vec::new();
 
         for (page_id, rec_lsn) in self.index.pool.dirty_page_table() {
@@ -212,8 +212,8 @@ impl Pager {
         Ok(checkpoint_lsn)
     }
 
-    pub fn recover(&mut self) -> Result<RecoveryReport, Box<dyn Error>> {
-        let chk_lsn = self.wal.header.last_checkpoint_lsn;
+    pub fn recover(&self) -> Result<RecoveryReport, Box<dyn Error>> {
+        let chk_lsn = self.wal.last_checkpoint_lsn();
         let mut dpt: HashMap<(bool, u64), u64> = HashMap::new();
         let mut att: HashMap<u64, u64> = HashMap::new();
         let mut start_lsn = 0;
@@ -286,11 +286,14 @@ impl Pager {
                     if self.index.index_file.metadata()?.len() < req_len {
                         self.index.index_file.set_len(req_len)?;
                     }
-                    if self.index.next_id <= page_id {
-                        self.index.next_id = page_id + 1;
+                    if self.index.next_id.load(std::sync::atomic::Ordering::SeqCst) <= page_id {
+                        self.index
+                            .next_id
+                            .store(page_id + 1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    let page = self.index.fetch_mut(page_id);
+                    let mut page = self.index.fetch_mut(page_id);
                     page.data[off..off + redo.len()].copy_from_slice(redo);
+                    drop(page);
                     self.index.pool.update_lsn(page_id, record.header.lsn);
                 } else {
                     let page_id = record.header.page_id;
@@ -298,11 +301,14 @@ impl Pager {
                     if self.heap.heap_file.metadata()?.len() < req_len {
                         self.heap.heap_file.set_len(req_len)?;
                     }
-                    if self.heap.next_id <= page_id {
-                        self.heap.next_id = page_id + 1;
+                    if self.heap.next_id.load(std::sync::atomic::Ordering::SeqCst) <= page_id {
+                        self.heap
+                            .next_id
+                            .store(page_id + 1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    let page = self.heap.fetch_mut(page_id)?;
+                    let mut page = self.heap.fetch_mut(page_id)?;
                     page.data[off..off + redo.len()].copy_from_slice(redo);
+                    drop(page);
                     self.heap.pool.update_lsn(page_id, record.header.lsn);
                 }
                 redone_records += 1;
@@ -321,10 +327,10 @@ impl Pager {
                 {
                     let off = offset as usize;
                     if record.header.is_index {
-                        let page = self.index.fetch_mut(record.header.page_id);
+                        let mut page = self.index.fetch_mut(record.header.page_id);
                         page.data[off..off + undo.len()].copy_from_slice(undo);
                     } else {
-                        let page = self.heap.fetch_mut(record.header.page_id)?;
+                        let mut page = self.heap.fetch_mut(record.header.page_id)?;
                         page.data[off..off + undo.len()].copy_from_slice(undo);
                     }
 

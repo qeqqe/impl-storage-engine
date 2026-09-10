@@ -199,3 +199,4 @@ impl WalHeader {
         buf[20..28].copy_from_slice(&self.next_lsn.to_le_bytes());
     }
 }
+

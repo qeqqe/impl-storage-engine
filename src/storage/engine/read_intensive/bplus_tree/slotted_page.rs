@@ -275,6 +275,7 @@ pub(super) struct HeapPointer {
     pub index: u64,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct HeapPage {
     pub data: [u8; super::heap::PAGE_SIZE],
 }
@@ -326,3 +327,4 @@ impl HeapPage {
         Ok(())
     }
 }
+
