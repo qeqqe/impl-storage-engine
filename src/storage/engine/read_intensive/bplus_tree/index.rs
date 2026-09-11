@@ -1,10 +1,11 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{error::Error, fs::File, os::unix::fs::FileExt, path::PathBuf};
 
 use crate::storage::engine::read_intensive::bplus_tree::{PageKind, header::IndexHeader};
 
-use super::{PAGE_SIZE, buffer_pool::BufferPool, slotted_page::Page};
+use super::{PAGE_SIZE, buffer_pool::BufferPool, slotted_page::Page, wal::Wal};
 
 const INDEX_POOL_CAPACITY: usize = 10_000;
 
@@ -13,6 +14,7 @@ pub(super) struct Index {
     pub index_path: PathBuf,
     pub pool: BufferPool<Page>,
     pub next_id: AtomicU64,
+    pub wal: Arc<Wal>,
 }
 
 pub(super) struct PageGuard<'a> {
@@ -42,7 +44,16 @@ impl<'a> Drop for PageGuard<'a> {
 }
 
 impl Index {
-    pub fn new(index_file: File, index_path: PathBuf) -> Self {
+    pub fn new(index_file: File, index_path: PathBuf, wal: Arc<Wal>) -> Self {
+        Self::new_with_capacity(index_file, index_path, wal, INDEX_POOL_CAPACITY)
+    }
+
+    pub fn new_with_capacity(
+        index_file: File,
+        index_path: PathBuf,
+        wal: Arc<Wal>,
+        capacity: usize,
+    ) -> Self {
         let next_id = index_file
             .metadata()
             .map(|m| m.len() / PAGE_SIZE as u64)
@@ -50,8 +61,9 @@ impl Index {
         Index {
             index_file,
             index_path,
-            pool: BufferPool::new(INDEX_POOL_CAPACITY),
+            pool: BufferPool::new(capacity),
             next_id: AtomicU64::new(next_id),
+            wal,
         }
     }
 
@@ -80,6 +92,11 @@ impl Index {
             .expect("buf pool capacity exceeded during allocate... all pages pinned...)")
             && evicted.was_dirty
         {
+            if evicted.page_lsn > 0 {
+                self.wal
+                    .flush_up_to(evicted.page_lsn)
+                    .expect("Failed to flush WAL during allocate");
+            }
             self.index_file
                 .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
                 .expect("Failed to write-back stolen page during allocate");
@@ -105,6 +122,11 @@ impl Index {
             .expect("buf pool capacity exceeded during index fetch... all pages pinned...")
             && evicted.was_dirty
         {
+            if evicted.page_lsn > 0 {
+                self.wal
+                    .flush_up_to(evicted.page_lsn)
+                    .expect("Failed to flush WAL during fetch");
+            }
             self.index_file
                 .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
                 .expect("Failed to write-back stolen page during fetch");
@@ -131,8 +153,13 @@ impl Index {
         if self.pool.is_dirty(id)
             && let Some(page) = self.pool.get(id)
         {
+            let lsn = self.pool.page_lsn(id);
+            if lsn > 0 {
+                self.wal.flush_up_to(lsn)?;
+            }
             let data = page.data;
             self.index_file.write_all_at(&data, Self::page_offset(id))?;
+            self.index_file.sync_data()?;
             self.pool.clear_dirty_single(id);
         }
         Ok(())
@@ -142,11 +169,21 @@ impl Index {
         let dirty_ids = self.pool.dirty_page_ids();
         for id in dirty_ids {
             if let Some(page) = self.pool.get(id) {
+                let lsn = self.pool.page_lsn(id);
+                if lsn > 0 {
+                    self.wal.flush_up_to(lsn)?;
+                }
                 let data = page.data;
                 self.index_file.write_all_at(&data, Self::page_offset(id))?;
             }
         }
+        self.index_file.sync_data()?;
         self.pool.clear_dirty();
+        Ok(())
+    }
+
+    pub fn sync_data(&self) -> Result<(), Box<dyn Error>> {
+        self.index_file.sync_data()?;
         Ok(())
     }
 

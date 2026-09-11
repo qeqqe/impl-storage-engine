@@ -10,12 +10,14 @@
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{error::Error, os::unix::fs::FileExt};
 
 use crate::storage::engine::read_intensive::bplus_tree::header::HEAP_HEADER_SIZE;
 
 use super::buffer_pool::BufferPool;
 use super::slotted_page::HeapPage;
+use super::wal::Wal;
 
 use super::{header::HeapHeader, slotted_page::CellPointer};
 
@@ -30,6 +32,7 @@ pub(super) struct Heap {
     pub path: std::path::PathBuf,
     pub next_id: AtomicU64,
     pub pool: BufferPool<HeapPage>,
+    pub wal: Arc<Wal>,
 }
 
 pub(super) struct HeapPageGuard<'a> {
@@ -59,7 +62,16 @@ impl<'a> Drop for HeapPageGuard<'a> {
 }
 
 impl Heap {
-    pub fn new(heap_file: File, path: std::path::PathBuf) -> Self {
+    pub fn new(heap_file: File, path: std::path::PathBuf, wal: Arc<Wal>) -> Self {
+        Self::new_with_capacity(heap_file, path, wal, HEAP_POOL_CAPACITY)
+    }
+
+    pub fn new_with_capacity(
+        heap_file: File,
+        path: std::path::PathBuf,
+        wal: Arc<Wal>,
+        capacity: usize,
+    ) -> Self {
         let next_id = heap_file
             .metadata()
             .map(|m| m.len() / PAGE_SIZE as u64)
@@ -68,7 +80,8 @@ impl Heap {
             heap_file,
             path,
             next_id: AtomicU64::new(next_id),
-            pool: BufferPool::new(HEAP_POOL_CAPACITY),
+            pool: BufferPool::new(capacity),
+            wal,
         }
     }
 
@@ -149,6 +162,9 @@ impl Heap {
         if let Some(evicted) = self.pool.insert(id, page)?
             && evicted.was_dirty
         {
+            if evicted.page_lsn > 0 {
+                self.wal.flush_up_to(evicted.page_lsn)?;
+            }
             self.heap_file
                 .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))?;
         }
@@ -196,6 +212,11 @@ impl Heap {
             .expect("Buffer pool capacity exceeded during allocate (all pages pinned)")
             && evicted.was_dirty
         {
+            if evicted.page_lsn > 0 {
+                self.wal
+                    .flush_up_to(evicted.page_lsn)
+                    .expect("Failed to flush WAL during allocate");
+            }
             self.heap_file
                 .write_all_at(&evicted.page.data, Self::page_offset(evicted.id))
                 .expect("Failed to write-back stolen page during allocate");
@@ -282,8 +303,13 @@ impl Heap {
         if self.pool.is_dirty(id)
             && let Some(page) = self.pool.get(id)
         {
+            let lsn = self.pool.page_lsn(id);
+            if lsn > 0 {
+                self.wal.flush_up_to(lsn)?;
+            }
             let data = page.data;
             self.heap_file.write_all_at(&data, Self::page_offset(id))?;
+            self.heap_file.sync_data()?;
             self.pool.clear_dirty_single(id);
         }
         Ok(())
@@ -293,11 +319,21 @@ impl Heap {
         let dirty_ids = self.pool.dirty_page_ids();
         for id in dirty_ids {
             if let Some(page) = self.pool.get(id) {
+                let lsn = self.pool.page_lsn(id);
+                if lsn > 0 {
+                    self.wal.flush_up_to(lsn)?;
+                }
                 let data = page.data;
                 self.heap_file.write_all_at(&data, Self::page_offset(id))?;
             }
         }
+        self.heap_file.sync_data()?;
         self.pool.clear_dirty();
+        Ok(())
+    }
+
+    pub fn sync_data(&self) -> Result<(), Box<dyn Error>> {
+        self.heap_file.sync_data()?;
         Ok(())
     }
 

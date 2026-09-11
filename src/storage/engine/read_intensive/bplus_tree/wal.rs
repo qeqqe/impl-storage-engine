@@ -466,6 +466,16 @@ pub(super) struct Wal {
     pub flushed_lsn: AtomicU64,
 }
 
+pub fn sync_parent_dir(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let dir = File::open(parent)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
 impl Wal {
     pub fn new(log_path: PathBuf) -> Result<Self, Box<dyn Error>> {
         let log_file = OpenOptions::new()
@@ -475,6 +485,8 @@ impl Wal {
             .truncate(false)
             .open(&log_path)?;
 
+        sync_parent_dir(&log_path)?;
+
         let existing_len = log_file.metadata()?.len();
 
         let header = if existing_len == 0 {
@@ -482,7 +494,7 @@ impl Wal {
                 last_checkpoint_lsn: 0,
                 last_wal_offset: WAL_HEADER_SIZE as u64,
                 last_wal_len: 0,
-                next_lsn: 0,
+                next_lsn: 1,
             };
             let mut buf = [0u8; WAL_HEADER_SIZE];
             h.serialize(&mut buf);
@@ -497,11 +509,7 @@ impl Wal {
             return Err("wal file exists but header is truncated/corrupt".into());
         };
 
-        let flushed_lsn = if header.next_lsn == 0 {
-            0
-        } else {
-            header.next_lsn - 1
-        };
+        let flushed_lsn = header.next_lsn.saturating_sub(1);
 
         let active_txns = HashMap::new();
         let wal_buffer = WalBuffer::new(WAL_POOL_CAPACITY);

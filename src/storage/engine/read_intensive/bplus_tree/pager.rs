@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     path::PathBuf,
+    sync::Arc,
 };
 
 use super::{
     heap::Heap,
     index::Index,
     slotted_page::Cell,
-    wal::{DirtyPageEntry, RecordType, UpdatePayload, Wal},
+    wal::{DirtyPageEntry, RecordType, UpdatePayload, Wal, sync_parent_dir},
 };
 
 pub struct RecoveryReport {
@@ -21,7 +22,7 @@ pub struct RecoveryReport {
 pub(super) struct Pager {
     pub index: Index,
     pub heap: Heap,
-    pub wal: Wal,
+    pub wal: Arc<Wal>,
 }
 
 impl Pager {
@@ -49,9 +50,12 @@ impl Pager {
             .truncate(false)
             .open(&index_path)?;
 
-        let heap = Heap::new(heap_file, heap_path);
-        let index = Index::new(index_file, index_path);
-        let wal = Wal::new(wal_path)?;
+        sync_parent_dir(&heap_path)?;
+        sync_parent_dir(&index_path)?;
+
+        let wal = Arc::new(Wal::new(wal_path)?);
+        let heap = Heap::new(heap_file, heap_path, Arc::clone(&wal));
+        let index = Index::new(index_file, index_path, Arc::clone(&wal));
 
         Ok(Pager { index, heap, wal })
     }
@@ -189,6 +193,9 @@ impl Pager {
     }
 
     pub fn fuzzy_checkpoint(&self) -> Result<u64, Box<dyn Error>> {
+        self.index.sync_data()?;
+        self.heap.sync_data()?;
+
         let mut dpt = Vec::new();
 
         for (page_id, rec_lsn) in self.index.pool.dirty_page_table() {

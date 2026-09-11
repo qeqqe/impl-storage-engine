@@ -1323,6 +1323,8 @@ struct Sibling {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use super::*;
     use wal::RecordType;
 
@@ -2125,5 +2127,325 @@ mod test {
         assert_eq!(btree.get(0, 10).unwrap(), vec![b"autocommit".to_vec()]);
         assert_eq!(btree.get(0, 20).unwrap(), vec![b"user_data".to_vec()]);
         assert!(btree.get(0, 30).is_err());
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = Arc::new(get_btree_in(dir.path()));
+
+        for i in 1..=50u64 {
+            btree
+                .insert(0, i, vec![format!("pre-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                for i in 1..=50u64 {
+                    let res = tree.get(0, i).unwrap();
+                    assert_eq!(res, vec![format!("pre-{}", i).into_bytes()]);
+                }
+            }));
+
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                let start = 100 + t * 25;
+                for i in start..start + 25 {
+                    let txn_id = 1000 + i;
+                    tree.begin_transaction(txn_id).unwrap();
+                    tree.insert(txn_id, i, vec![format!("thread-{}", i).into_bytes()])
+                        .unwrap();
+                    tree.commit_transaction(txn_id).unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for i in 1..=50u64 {
+            let res = btree.get(0, i).unwrap();
+            assert_eq!(res, vec![format!("pre-{}", i).into_bytes()]);
+        }
+
+        for t in 0..4 {
+            let start = 100 + t * 25;
+            for i in start..start + 25 {
+                let res = btree.get(0, i).unwrap();
+                assert_eq!(res, vec![format!("thread-{}", i).into_bytes()]);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_insert_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = Arc::new(get_btree_in(dir.path()));
+
+        let num_threads = 6;
+        let items_per_thread = 40;
+        let mut handles = Vec::new();
+
+        for t in 0..num_threads {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                let start = t * items_per_thread + 1;
+                let end = start + items_per_thread;
+                for i in start..end {
+                    let txn_id = 5000 + i;
+                    tree.begin_transaction(txn_id).unwrap();
+                    tree.insert(txn_id, i, vec![format!("item-{}", i).into_bytes()])
+                        .unwrap();
+                    tree.commit_transaction(txn_id).unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let total = num_threads * items_per_thread;
+        for i in 1..=total {
+            let res = btree.get(0, i).unwrap();
+            assert_eq!(res, vec![format!("item-{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn concurrent_mutations_and_fuzzy_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = Arc::new(get_btree_in(dir.path()));
+
+        let mut handles = Vec::new();
+
+        for t in 0..3 {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                let start = t * 30 + 1;
+                for i in start..start + 30 {
+                    let txn_id = 10000 + i;
+                    tree.begin_transaction(txn_id).unwrap();
+                    tree.insert(txn_id, i, vec![format!("val-{}", i).into_bytes()])
+                        .unwrap();
+                    tree.commit_transaction(txn_id).unwrap();
+                }
+            }));
+        }
+
+        let tree = Arc::clone(&btree);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..5 {
+                let _ = tree.fuzzy_checkpoint();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }));
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for i in 1..=90 {
+            let res = btree.get(0, i).unwrap();
+            assert_eq!(res, vec![format!("val-{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn concurrent_deletions_and_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = Arc::new(get_btree_in(dir.path()));
+
+        for i in 1..=100u64 {
+            btree
+                .insert(0, i, vec![format!("data-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+
+        for t in 0..2 {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                let start = t * 25 + 1;
+                for i in start..start + 25 {
+                    let txn_id = 20000 + i;
+                    tree.begin_transaction(txn_id).unwrap();
+                    tree.delete(txn_id, i).unwrap();
+                    tree.commit_transaction(txn_id).unwrap();
+                }
+            }));
+        }
+
+        for _ in 0..2 {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                for i in 51..=100 {
+                    let res = tree.get(0, i);
+                    if let Ok(val) = res {
+                        assert_eq!(val, vec![format!("data-{}", i).into_bytes()]);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for i in 1..=50 {
+            assert!(btree.get(0, i).is_err());
+        }
+        for i in 51..=100 {
+            let res = btree.get(0, i).unwrap();
+            assert_eq!(res, vec![format!("data-{}", i).into_bytes()]);
+        }
+    }
+
+    #[test]
+    fn concurrent_transactions_commit_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let btree = Arc::new(get_btree_in(dir.path()));
+
+        for i in 1..=10u64 {
+            btree
+                .insert(0, i, vec![format!("base-{}", i).into_bytes()])
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let tree = Arc::clone(&btree);
+            handles.push(std::thread::spawn(move || {
+                let start = 100 + t * 25;
+                for i in start..start + 25 {
+                    let txn_id = 30000 + i;
+                    tree.begin_transaction(txn_id).unwrap();
+                    tree.insert(txn_id, i, vec![format!("committed-{}", i).into_bytes()])
+                        .unwrap();
+                    tree.commit_transaction(txn_id).unwrap();
+                }
+            }));
+        }
+
+        let tree = Arc::clone(&btree);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..5 {
+                let _ = tree.fuzzy_checkpoint();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }));
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        btree.pager.wal.flush_all().unwrap();
+        let (idx_dirty, heap_dirty) = btree.pager.dirty_pages();
+        for p in idx_dirty {
+            btree.pager.flush_index_page(p).unwrap();
+        }
+        for p in heap_dirty {
+            btree.pager.flush_heap_page(p).unwrap();
+        }
+
+        btree.pager.discard_all_dirty();
+
+        btree.recover().unwrap();
+
+        for i in 1..=10u64 {
+            let res = btree.get(0, i).unwrap();
+            assert_eq!(res, vec![format!("base-{}", i).into_bytes()]);
+        }
+
+        for t in 0..4 {
+            let start = 100 + t * 25;
+            for i in start..start + 25 {
+                let res = btree.get(0, i).unwrap();
+                assert_eq!(res, vec![format!("committed-{}", i).into_bytes()]);
+            }
+        }
+    }
+
+    #[test]
+    fn wal_steal_eviction_forces_wal_flush_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join("test_index.db");
+        let wal_path = dir.path().join("test_wal.db");
+
+        let wal = Arc::new(wal::Wal::new(wal_path).unwrap());
+        let idx_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&idx_path)
+            .unwrap();
+
+        let index = index::Index::new_with_capacity(idx_file, idx_path, Arc::clone(&wal), 2);
+
+        let p0 = index.allocate(PageKind::Leaf);
+        let _p1 = index.allocate(PageKind::Leaf);
+
+        let payload = wal::UpdatePayload {
+            offset_in_page: 0,
+            undo_data: &[0u8; 4],
+            redo_data: &[1u8; 4],
+        };
+        let lsn = wal
+            .write_record(1, wal::RecordType::Update, p0, true, payload)
+            .unwrap();
+        index.pool.update_lsn(p0, lsn);
+
+        assert!(wal.flushed_lsn() < lsn);
+
+        let _p2 = index.allocate(PageKind::Leaf);
+        let _p3 = index.allocate(PageKind::Leaf);
+
+        assert!(wal.flushed_lsn() >= lsn);
+    }
+
+    #[test]
+    fn heap_steal_eviction_forces_wal_flush_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap_path = dir.path().join("test_heap.db");
+        let wal_path = dir.path().join("test_wal.db");
+
+        let wal = Arc::new(wal::Wal::new(wal_path).unwrap());
+        let heap_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&heap_path)
+            .unwrap();
+
+        let heap = heap::Heap::new_with_capacity(heap_file, heap_path, Arc::clone(&wal), 2);
+
+        let p0 = heap.allocate();
+        let _p1 = heap.allocate();
+
+        let payload = wal::UpdatePayload {
+            offset_in_page: 0,
+            undo_data: &[0u8; 4],
+            redo_data: &[1u8; 4],
+        };
+        let lsn = wal
+            .write_record(1, wal::RecordType::Update, p0, false, payload)
+            .unwrap();
+        heap.pool.update_lsn(p0, lsn);
+
+        assert!(wal.flushed_lsn() < lsn);
+
+        let _p2 = heap.allocate();
+        let _p3 = heap.allocate();
+
+        assert!(wal.flushed_lsn() >= lsn);
     }
 }
