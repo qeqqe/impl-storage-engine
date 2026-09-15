@@ -30,9 +30,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::storage::engine::read_intensive::bplus_tree::wal_buffer::WalBuffer;
-
-use super::{header::WAL_HEADER_SIZE, header::WalHeader};
+use super::{header::WAL_HEADER_SIZE, header::WalHeader, wal_buffer::WalBuffer};
 
 pub const WAL_RECORD_HEADER_SIZE: usize = 8 + 4 + 8 + 1 + 1 + 8 + 4 + 2; // 36 bytes
 pub const WAL_POOL_CAPACITY: usize = 10_000;
