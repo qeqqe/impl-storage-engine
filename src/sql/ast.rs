@@ -55,19 +55,44 @@ pub struct DropTable {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub columns: Vec<SelectColumn>,
-    pub from: String,
+    pub from: TableRef,
     pub where_clause: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub base: String,
+    pub base_alias: Option<String>,
+    pub joins: Vec<Join>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub table: String,
+    pub alias: Option<String>,
+    pub join_type: JoinType,
+    pub on: Option<Expr>, // NOTE: None only possible on JoinType::Cross
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectColumn {
     Wildcard,
-
-    Column(String),
-
+    QualifiedWildcard(String), // table.*
+    Column { table: Option<String>, name: String },
     Expr { expr: Expr, alias: Option<String> },
 }
 
@@ -105,7 +130,10 @@ pub struct Delete {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Column(String),
+    Column {
+        table: Option<String>,
+        name: String,
+    },
 
     Literal(LiteralValue),
 

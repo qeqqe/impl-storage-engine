@@ -233,7 +233,7 @@ impl Parser {
                 "Exactly one table in FROM required".into(),
             ));
         } else {
-            Self::extract_from_table(&select.from[0])?
+            Self::extract_table_ref(&select.from[0])?
         };
 
         // SELECT columns
@@ -244,6 +244,29 @@ impl Parser {
             .as_ref()
             .map(Self::convert_expr)
             .transpose()?;
+
+        // GROUP BY
+        let group_by = match &select.group_by {
+            sp::GroupByExpr::Expressions(exprs, modifiers) => {
+                if !modifiers.is_empty() {
+                    return Err(ParseError::UnsupportedStatement(
+                        "GROUP BY ROLLUP/CUBE/GROUPING SETS not supported".into(),
+                    ));
+                }
+                exprs
+                    .iter()
+                    .map(Self::convert_expr)
+                    .collect::<ParseResult<Vec<_>>>()?
+            }
+            sp::GroupByExpr::All(_) => {
+                return Err(ParseError::UnsupportedStatement(
+                    "GROUP BY ALL not supported".into(),
+                ));
+            }
+        };
+
+        // HAVING
+        let having = select.having.as_ref().map(Self::convert_expr).transpose()?;
 
         let order_by = query
             .order_by
@@ -267,6 +290,8 @@ impl Parser {
             columns,
             from,
             where_clause,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
@@ -276,56 +301,63 @@ impl Parser {
     fn convert_projection(items: &[sp::SelectItem]) -> ParseResult<Vec<SelectColumn>> {
         items
             .iter()
-            .map(|item| {
-                match item {
-                    sp::SelectItem::Wildcard(_) => Ok(SelectColumn::Wildcard),
-                    sp::SelectItem::UnnamedExpr(expr) => match expr {
-                        sp::Expr::Identifier(ident) => {
-                            Ok(SelectColumn::Column(ident.value.clone()))
-                        }
-                        sp::Expr::CompoundIdentifier(parts) => {
-                            let col = parts.last().map(|p| p.value.clone()).ok_or_else(|| {
-                                ParseError::InvalidIdentifier("empty compound identifier".into())
-                            })?;
-                            Ok(SelectColumn::Column(col))
-                        }
-                        _ => {
-                            let e = Self::convert_expr(expr)?;
-                            Ok(SelectColumn::Expr {
-                                expr: e,
-                                alias: None,
-                            })
-                        }
+            .map(|item| match item {
+                sp::SelectItem::Wildcard(_) => Ok(SelectColumn::Wildcard),
+                sp::SelectItem::UnnamedExpr(expr) => match expr {
+                    sp::Expr::Identifier(ident) => Ok(SelectColumn::Column {
+                        table: None,
+                        name: ident.value.clone(),
+                    }),
+                    sp::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                        [table, col] => Ok(SelectColumn::Column {
+                            table: Some(table.value.clone()),
+                            name: col.value.clone(),
+                        }),
+                        _ => Err(ParseError::UnsupportedExpression(format!(
+                            "Unsupported identifier depth: {:?}",
+                            parts
+                        ))),
                     },
-                    sp::SelectItem::ExprWithAlias { expr, alias } => {
+                    _ => {
                         let e = Self::convert_expr(expr)?;
                         Ok(SelectColumn::Expr {
                             expr: e,
-                            alias: Some(alias.value.clone()),
+                            alias: None,
                         })
                     }
-                    sp::SelectItem::ExprWithAliases { expr, aliases } => {
-                        let e = Self::convert_expr(expr)?;
-                        Ok(SelectColumn::Expr {
-                            expr: e,
-                            alias: aliases.first().map(|a| a.value.clone()),
-                        })
-                    }
-                    sp::SelectItem::QualifiedWildcard(name, _) => {
-                        // table.* - we treat as wildcard for now
-                        Err(ParseError::UnsupportedExpression(format!(
-                            "Qualified wildcard: {:?}",
-                            name
-                        )))
-                    }
+                },
+                sp::SelectItem::ExprWithAlias { expr, alias } => {
+                    let e = Self::convert_expr(expr)?;
+                    Ok(SelectColumn::Expr {
+                        expr: e,
+                        alias: Some(alias.value.clone()),
+                    })
                 }
+                sp::SelectItem::ExprWithAliases { expr, aliases } => {
+                    let e = Self::convert_expr(expr)?;
+                    Ok(SelectColumn::Expr {
+                        expr: e,
+                        alias: aliases.first().map(|a| a.value.clone()),
+                    })
+                }
+                sp::SelectItem::QualifiedWildcard(kind, _) => match kind {
+                    sp::SelectItemQualifiedWildcardKind::ObjectName(name) => Ok(
+                        SelectColumn::QualifiedWildcard(Self::extract_table_name(name)?),
+                    ),
+                    other => Err(ParseError::UnsupportedExpression(format!(
+                        "Unsupported qualified wildcard: {:?}",
+                        other
+                    ))),
+                },
             })
             .collect()
     }
 
     fn extract_order_by_exprs(ob: &sp::OrderBy) -> ParseResult<Vec<OrderBy>> {
         match &ob.kind {
-            sp::OrderByKind::All(_) => Ok(vec![]),
+            sp::OrderByKind::All(_) => Err(ParseError::UnsupportedStatement(
+                "ORDER BY ALL not supported".into(),
+            )),
             sp::OrderByKind::Expressions(exprs) => {
                 exprs.iter().map(Self::convert_order_by_expr).collect()
             }
@@ -392,7 +424,7 @@ impl Parser {
         assignments: &[sp::Assignment],
         selection: &Option<sp::Expr>,
     ) -> ParseResult<Statement> {
-        let table_name = Self::extract_from_table(table)?;
+        let table_name = Self::extract_single_table(table)?;
 
         let assigns = assignments
             .iter()
@@ -456,7 +488,7 @@ impl Parser {
             ));
         }
 
-        let table = Self::extract_from_table(&tables[0])?;
+        let table = Self::extract_single_table(&tables[0])?;
         let where_clause = delete
             .selection
             .as_ref()
@@ -471,15 +503,21 @@ impl Parser {
 
     fn convert_expr(expr: &sp::Expr) -> ParseResult<Expr> {
         match expr {
-            sp::Expr::Identifier(id) => Ok(Expr::Column(id.value.clone())),
+            sp::Expr::Identifier(id) => Ok(Expr::Column {
+                table: None,
+                name: id.value.clone(),
+            }),
 
-            sp::Expr::CompoundIdentifier(parts) => {
-                // table.column - just use column for now
-                let col = parts.last().map(|p| p.value.clone()).ok_or_else(|| {
-                    ParseError::InvalidIdentifier("empty compound identifier".into())
-                })?;
-                Ok(Expr::Column(col))
-            }
+            sp::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [table, col] => Ok(Expr::Column {
+                    table: Some(table.value.clone()),
+                    name: col.value.clone(),
+                }),
+                _ => Err(ParseError::UnsupportedExpression(format!(
+                    "Unsupported identifier depth: {:?}",
+                    parts
+                ))),
+            },
 
             sp::Expr::Value(v) => Ok(Expr::Literal(Self::convert_value(v)?)),
 
@@ -692,14 +730,89 @@ impl Parser {
         }
     }
 
-    fn extract_from_table(from: &sp::TableWithJoins) -> ParseResult<String> {
-        match &from.relation {
-            sp::TableFactor::Table { name, .. } => Self::extract_table_name(name),
+    fn extract_table_factor(factor: &sp::TableFactor) -> ParseResult<(String, Option<String>)> {
+        match factor {
+            sp::TableFactor::Table { name, alias, .. } => {
+                let table = Self::extract_table_name(name)?;
+                Ok((table, alias.as_ref().map(|a| a.name.value.clone())))
+            }
             other => Err(ParseError::UnsupportedStatement(format!(
-                "Unsupported FROM clause: {:?}",
+                "Unsupported table factor: {:?}",
                 other
             ))),
         }
+    }
+
+    fn extract_table_ref(from: &sp::TableWithJoins) -> ParseResult<TableRef> {
+        let (base, base_alias) = Self::extract_table_factor(&from.relation)?;
+        let joins = from
+            .joins
+            .iter()
+            .map(Self::convert_join)
+            .collect::<ParseResult<Vec<_>>>()?;
+        Ok(TableRef {
+            base,
+            base_alias,
+            joins,
+        })
+    }
+
+    fn convert_join(join: &sp::Join) -> ParseResult<Join> {
+        let (table, alias) = Self::extract_table_factor(&join.relation)?;
+
+        let (join_type, constraint) = match &join.join_operator {
+            sp::JoinOperator::Join(c) | sp::JoinOperator::Inner(c) => (JoinType::Inner, c),
+            sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinType::Left, c),
+            sp::JoinOperator::Right(c) | sp::JoinOperator::RightOuter(c) => (JoinType::Right, c),
+            sp::JoinOperator::FullOuter(c) => (JoinType::Full, c),
+            sp::JoinOperator::CrossJoin(_) => {
+                return Ok(Join {
+                    table,
+                    alias,
+                    join_type: JoinType::Cross,
+                    on: None,
+                });
+            }
+            other => {
+                return Err(ParseError::UnsupportedStatement(format!(
+                    "Unsupported join type: {:?}",
+                    other
+                )));
+            }
+        };
+
+        let on = match constraint {
+            sp::JoinConstraint::On(expr) => Some(Self::convert_expr(expr)?),
+            sp::JoinConstraint::Using(_) => {
+                return Err(ParseError::UnsupportedStatement(
+                    "JOIN ... USING not supported, use ON".into(),
+                ));
+            }
+            sp::JoinConstraint::Natural => {
+                return Err(ParseError::UnsupportedStatement(
+                    "NATURAL JOIN not supported".into(),
+                ));
+            }
+            sp::JoinConstraint::None => {
+                return Err(ParseError::MissingClause("JOIN ... ON condition".into()));
+            }
+        };
+
+        Ok(Join {
+            table,
+            alias,
+            join_type,
+            on,
+        })
+    }
+
+    fn extract_single_table(from: &sp::TableWithJoins) -> ParseResult<String> {
+        if !from.joins.is_empty() {
+            return Err(ParseError::UnsupportedStatement(
+                "JOIN not supported in UPDATE/DELETE".into(),
+            ));
+        }
+        Self::extract_table_factor(&from.relation).map(|(t, _)| t)
     }
 
     fn expr_to_usize(expr: &sp::Expr) -> Option<usize> {
@@ -930,6 +1043,429 @@ mod tests {
                 assert!(email_col.constraints.contains(&ColumnConstraint::Unique));
             }
             _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_qualified_column_in_expr() {
+        let sql = "SELECT * FROM users WHERE users.age >= 18";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => match s.where_clause.unwrap() {
+                Expr::BinaryOp { left, .. } => {
+                    assert_eq!(
+                        *left,
+                        Expr::Column {
+                            table: Some("users".into()),
+                            name: "age".into(),
+                        }
+                    );
+                }
+                other => panic!("Expected BinaryOp, got {:?}", other),
+            },
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_unqualified_column_in_expr() {
+        let sql = "SELECT * FROM users WHERE age >= 18";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => match s.where_clause.unwrap() {
+                Expr::BinaryOp { left, .. } => {
+                    assert_eq!(
+                        *left,
+                        Expr::Column {
+                            table: None,
+                            name: "age".into(),
+                        }
+                    );
+                }
+                other => panic!("Expected BinaryOp, got {:?}", other),
+            },
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_qualified_column_in_projection() {
+        let sql = "SELECT a.id, b.name FROM a JOIN b ON a.id = b.a_id";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.columns[0],
+                    SelectColumn::Column {
+                        table: Some("a".into()),
+                        name: "id".into(),
+                    }
+                );
+                assert_eq!(
+                    s.columns[1],
+                    SelectColumn::Column {
+                        table: Some("b".into()),
+                        name: "name".into(),
+                    }
+                );
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_unqualified_column_in_projection() {
+        let sql = "SELECT id, name FROM users";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.columns[0],
+                    SelectColumn::Column {
+                        table: None,
+                        name: "id".into(),
+                    }
+                );
+                assert_eq!(
+                    s.columns[1],
+                    SelectColumn::Column {
+                        table: None,
+                        name: "name".into(),
+                    }
+                );
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.base, "a");
+                assert!(s.from.base_alias.is_none());
+                assert_eq!(s.from.joins.len(), 1);
+                let j = &s.from.joins[0];
+                assert_eq!(j.table, "b");
+                assert_eq!(j.join_type, JoinType::Inner);
+                match j.on.as_ref().unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert_eq!(
+                            **left,
+                            Expr::Column {
+                                table: Some("a".into()),
+                                name: "id".into(),
+                            }
+                        );
+                        assert_eq!(*op, BinaryOperator::Eq);
+                        assert_eq!(
+                            **right,
+                            Expr::Column {
+                                table: Some("b".into()),
+                                name: "a_id".into(),
+                            }
+                        );
+                    }
+                    other => panic!("Expected BinaryOp ON condition, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_left_join() {
+        let sql = "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.joins.len(), 1);
+                assert_eq!(s.from.joins[0].join_type, JoinType::Left);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_joins() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id";
+        let stmt = Parser::parse(sql).unwrap();
+        println!("{:#?}", stmt);
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.base, "a");
+                assert_eq!(s.from.joins.len(), 2);
+                assert_eq!(s.from.joins[0].table, "b");
+                assert_eq!(s.from.joins[0].join_type, JoinType::Inner);
+                assert_eq!(s.from.joins[1].table, "c");
+                assert_eq!(s.from.joins[1].join_type, JoinType::Left);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_table_alias() {
+        let sql = "SELECT u.name FROM users AS u";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.base, "users");
+                assert_eq!(s.from.base_alias.as_deref(), Some("u"));
+                assert_eq!(
+                    s.columns[0],
+                    SelectColumn::Column {
+                        table: Some("u".into()),
+                        name: "name".into(),
+                    }
+                );
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_join_alias() {
+        let sql = "SELECT * FROM a JOIN b AS bb ON a.id = bb.a_id";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.joins[0].table, "b");
+                assert_eq!(s.from.joins[0].alias.as_deref(), Some("bb"));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let sql = "SELECT * FROM a CROSS JOIN b";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.joins.len(), 1);
+                assert_eq!(s.from.joins[0].join_type, JoinType::Cross);
+                assert!(s.from.joins[0].on.is_none());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_group_by() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.group_by.len(), 1);
+                assert_eq!(
+                    s.group_by[0],
+                    Expr::Column {
+                        table: None,
+                        name: "name".into(),
+                    }
+                );
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_having() {
+        let sql = "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert!(s.having.is_some());
+                assert_eq!(s.group_by.len(), 1);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_no_group_by_produces_empty_vec() {
+        let sql = "SELECT * FROM users";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert!(s.group_by.is_empty());
+                assert!(s.having.is_none());
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_all_errors() {
+        let sql = "SELECT name FROM users GROUP BY ALL";
+        let result = Parser::parse(sql);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::UnsupportedStatement(msg) => {
+                assert!(msg.contains("GROUP BY ALL"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_order_by_all_parsed_as_column() {
+        let sql = "SELECT * FROM users ORDER BY ALL";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.order_by.len(), 1);
+                // NOTE:`sqlparser::GenericDialect` treats ALL as a column name,
+                // not OrderByKind::All The error path in extract_order_by_exprs
+                // still guards against OrderByKind::All if a dialect that
+                // supports it is ever used "ALL" parsed as a regular column name
+                assert_eq!(s.order_by[0].column, "ALL");
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_qualified_wildcard() {
+        let sql = "SELECT a.* FROM a JOIN b ON a.id = b.a_id";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.columns[0], SelectColumn::QualifiedWildcard("a".into()));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_update_rejects_join() {
+        let sql = "UPDATE a JOIN b ON a.id = b.a_id SET a.name = 'x'";
+        let result = Parser::parse(sql);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::UnsupportedStatement(msg) => {
+                assert!(msg.contains("JOIN"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_join_using_errors() {
+        let sql = "SELECT * FROM a JOIN b USING (id)";
+        let result = Parser::parse(sql);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::UnsupportedStatement(msg) => {
+                assert!(msg.contains("USING"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_natural_join_errors() {
+        let sql = "SELECT * FROM a NATURAL JOIN b";
+        let result = Parser::parse(sql);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::UnsupportedStatement(msg) => {
+                assert!(msg.contains("NATURAL"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_full_integration_query() {
+        let sql = "SELECT a.id, b.name FROM a JOIN b ON a.id = b.a_id WHERE a.age >= 18 GROUP BY b.name HAVING COUNT(*) > 1";
+        let stmt = Parser::parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.columns[0],
+                    SelectColumn::Column {
+                        table: Some("a".into()),
+                        name: "id".into(),
+                    }
+                );
+                assert_eq!(
+                    s.columns[1],
+                    SelectColumn::Column {
+                        table: Some("b".into()),
+                        name: "name".into(),
+                    }
+                );
+
+                assert_eq!(s.from.base, "a");
+                assert_eq!(s.from.joins.len(), 1);
+                assert_eq!(s.from.joins[0].table, "b");
+                assert_eq!(s.from.joins[0].join_type, JoinType::Inner);
+
+                match s.from.joins[0].on.as_ref().unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert_eq!(
+                            **left,
+                            Expr::Column {
+                                table: Some("a".into()),
+                                name: "id".into(),
+                            }
+                        );
+                        assert_eq!(*op, BinaryOperator::Eq);
+                        assert_eq!(
+                            **right,
+                            Expr::Column {
+                                table: Some("b".into()),
+                                name: "a_id".into(),
+                            }
+                        );
+                    }
+                    other => panic!("Expected BinaryOp, got {:?}", other),
+                }
+
+                match s.where_clause.as_ref().unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert_eq!(
+                            **left,
+                            Expr::Column {
+                                table: Some("a".into()),
+                                name: "age".into(),
+                            }
+                        );
+                        assert_eq!(*op, BinaryOperator::GtEq);
+                        assert_eq!(**right, Expr::Literal(LiteralValue::Integer(18)));
+                    }
+                    other => panic!("Expected BinaryOp, got {:?}", other),
+                }
+
+                assert_eq!(s.group_by.len(), 1);
+                assert_eq!(
+                    s.group_by[0],
+                    Expr::Column {
+                        table: Some("b".into()),
+                        name: "name".into(),
+                    }
+                );
+
+                assert!(s.having.is_some());
+                match s.having.as_ref().unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert_eq!(*op, BinaryOperator::Gt);
+                        match left.as_ref() {
+                            Expr::Function { name, .. } => {
+                                assert_eq!(name.to_uppercase(), "COUNT");
+                            }
+                            other => panic!("Expected Function, got {:?}", other),
+                        }
+                        assert_eq!(**right, Expr::Literal(LiteralValue::Integer(1)));
+                    }
+                    other => panic!("Expected BinaryOp, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Select"),
         }
     }
 }
